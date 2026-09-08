@@ -58,7 +58,24 @@ No fabricated public URLs or evidence are included (evidence arrives in a later 
 - `schema.cypher` — indexes (model decisions/comments)
 - `seed.cypher` — deterministic synthetic seed data (idempotent via `MERGE`)
 - `seed.py` — applies schema + seed to FalkorDB
-- `verify.py` — runs traversal / negative / incident checks
+- `verify.py` — runs traversal / negative / incident checks + Phase 3 investigation tests
+- `queries.py` — Phase 3 blast-radius investigation queries (see below)
+
+## Phase 3 investigation engine
+`queries.py` runs the graph-native blast-radius investigation:
+- `investigate_artifact(graph, id, max_depth=8)` — full investigation report.
+- `downstream_nodes(...)` — distinct reachable dependents + min-hop distance.
+- `production_applications(...)` — downstream apps with an actual
+  `(:Deployment {environment:'production'})-[:DEPLOYS]->` edge.
+- `applications_paths(...)` — shortest graph path (returned by FalkorDB) to each affected
+  application, `incidents_on(...)` — `(:Incident)-[:AFFECTS]->` the artifact.
+
+The core traversal is a single bounded, variable-length pattern over the downstream edge
+set — every relationship that flows *into* the investigated node:
+`TRAINED_ON | BASED_ON | DEPENDS_ON | HAS_VULNERABILITY | POWERED_BY | USES_TOOL |
+USES_MODEL | USES_AGENT | DEPLOYS*1..max_depth`. Relationship-type alternation (`|`) is
+FalkorDB-supported. See the root `README.md` for the full Cypher and the
+`GET /api/investigate/{artifact_id}` contract.
 
 ## Commands (from repo root, with FalkorDB running)
 ```
@@ -68,6 +85,6 @@ docker compose up -d
 # seed (idempotent)
 python -m graph.seed
 
-# verify the graph
+# verify the graph + investigation queries
 python -m graph.verify
 ```
