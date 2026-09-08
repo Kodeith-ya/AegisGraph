@@ -1,5 +1,5 @@
 from fastapi import FastAPI, Response
-from graph import get_graph
+from db import get_graph
 
 app = FastAPI(title="AegisGraph API")
 
