@@ -32,6 +32,7 @@
 // :Deployment         -> DEP1..DEP3, DEP_UNRELATED
 // :Vulnerability      -> V1
 // :Incident           -> INC1, INC2
+// :Evidence           -> E1, E2, E3  (provenance/support records)
 //
 // ============================================================
 // RELATIONSHIP TYPES
@@ -48,7 +49,28 @@
 // (:Application)-[:USES_AGENT]->(:Agent)
 // (:Deployment)-[:DEPLOYS]->(:Application)
 // (:Incident)-[:AFFECTS]->(artifact label)
+// (:Incident)-[:SUPPORTED_BY]->(:Evidence)             # incident has evidence
+// (:Evidence)-[:DESCRIBES]->(:Dataset | :ModelVersion | :PackageVersion
+//                              | :Vulnerability)       # evidence describes artifact
 //
+// Evidence is a FIRST-CLASS provenance model. It deliberately does NOT
+// link through a generic `Evidence -> Artifact` abstraction: each
+// evidence record references concrete artifacts only, so a query can
+// always tell exactly which artifact a record describes and which
+// incident it supports.
+//
+// Evidence node properties (Phase 5):
+//   id           unique identifier (e.g. E1)
+//   title        human-readable summary
+//   source       source identifier (never fabricated)
+//   source_type  "synthetic" | "public"  (validated upstream)
+//   confidence   in [0.0, 1.0], validated before risk use
+//   observed_at  ISO-8601 date the record was observed/created
+//   description  free-text requirement/support note
+// These records are seeded as clearly-labeled SYNTHETIC demo evidence
+// (source prefixes like "aegisgraph-demo-*"); public ingestion is a
+// later phase and must leave the schema compatible (source_type =
+// "public") without adding external API dependencies today.
 // ============================================================
 // INDEXES
 // ------------------------------------------------------------
@@ -72,3 +94,4 @@ CREATE INDEX FOR (n:Application) ON (n.id)
 CREATE INDEX FOR (n:Deployment) ON (n.id)
 CREATE INDEX FOR (n:Vulnerability) ON (n.id)
 CREATE INDEX FOR (n:Incident) ON (n.id)
+CREATE INDEX FOR (n:Evidence) ON (n.id)

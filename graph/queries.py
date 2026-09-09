@@ -4,6 +4,19 @@ All reasoning is performed by FalkorDB via Cypher. This module only
 orchestrates queries and structures results; it never fabricates
 affected entities, paths, or counts.
 
+Evidence & provenance (Phase 5)
+-------------------------------
+`evidence_for` retrieves evidence that either:
+
+* DESCRIBES the investigated artifact directly
+  ``(a)<-[:DESCRIBES]-(e:Evidence)``
+* SUPPORTS an incident that AFFECTS the artifact
+  ``(a)<-[:AFFECTS]-(i:Incident)-[:SUPPORTED_BY]->(e:Evidence)``
+
+Both patterns are bounded (no variable-length paths) and use the
+artifact id strictly as a bind parameter. Evidence records are returned
+exactly as stored in the graph — the endpoint never invents support.
+
 Downstream semantics
 --------------------
 A *downstream dependent* is reached with:
@@ -50,6 +63,17 @@ ARTIFACT_LABELS = (
     "Application",
     "Deployment",
     "Vulnerability",
+)
+
+# Evidence node fields surfaced by the API (all stored on :Evidence).
+EVIDENCE_FIELDS = (
+    "id",
+    "title",
+    "source",
+    "source_type",
+    "confidence",
+    "observed_at",
+    "description",
 )
 
 
@@ -264,6 +288,60 @@ def incidents_on(graph, artifact_id: str):
     return incidents
 
 
+def _evidence_dict(node) -> dict:
+    """Flatten an :Evidence node exactly as stored (no fabrication)."""
+    props = dict(getattr(node, "properties", None) or {})
+    return {field: props.get(field) for field in EVIDENCE_FIELDS}
+
+
+def evidence_for(graph, artifact_id: str):
+    """Evidence supporting an investigation of `artifact_id`.
+
+    Collects evidence that DESCRIBES the artifact and evidence that
+    SUPPORTS incidents affecting it, then merges by evidence id (two
+    bounded queries; no variable-length traversal). Returns a list of
+    evidence records (source fields + provenance keys) sorted by id,
+    populated ONLY from graph facts.
+    """
+    merged = {}
+    queries = (
+        # Evidence that describes the artifact directly.
+        ("MATCH (a {id: $id})<-[:DESCRIBES]-(e:Evidence) RETURN e, a.id AS aid",
+         "described_artifacts"),
+        # Evidence supporting an incident that affects the artifact.
+        ("MATCH (a {id: $id})<-[:AFFECTS]-(i:Incident)-[:SUPPORTED_BY]->(e:Evidence) RETURN e, i.id AS iid",
+         "supported_incidents"),
+    )
+    for cypher, key in queries:
+        res = graph.query(cypher, {"id": artifact_id})
+        if not res or not res.result_set:
+            continue
+        for cell in res.result_set:
+            record = _evidence_dict(cell[0])
+            eid = record.get("id")
+            if eid is None:
+                continue
+            entry = merged.setdefault(
+                eid, {"evidence": record, "supported_incidents": [], "described_artifacts": []}
+            )
+            entry[key].append(cell[1])
+
+    return [
+        {
+            "id": entry["evidence"]["id"],
+            "title": entry["evidence"]["title"],
+            "source": entry["evidence"]["source"],
+            "source_type": entry["evidence"]["source_type"],
+            "confidence": entry["evidence"]["confidence"],
+            "observed_at": entry["evidence"]["observed_at"],
+            "description": entry["evidence"]["description"],
+            "supported_incidents": sorted(set(entry["supported_incidents"])),
+            "described_artifacts": sorted(set(entry["described_artifacts"])),
+        }
+        for _, entry in sorted(merged.items())
+    ]
+
+
 def investigate_artifact(graph, artifact_id: str, max_depth=None) -> dict:
     """Full investigation for a single artifact (pure graph reasoning).
 
@@ -279,6 +357,7 @@ def investigate_artifact(graph, artifact_id: str, max_depth=None) -> dict:
     dependents = downstream_dependents(graph, artifact_id, max_depth=max_depth)
     incidents = incidents_on(graph, artifact_id)
     depth = maximum_depth(graph, artifact_id, max_depth=max_depth)
+    evidence = evidence_for(graph, artifact_id)
 
     return {
         "artifact": artifact,
@@ -300,5 +379,6 @@ def investigate_artifact(graph, artifact_id: str, max_depth=None) -> dict:
             for p in sorted(prod, key=lambda x: (x["hops"], x["application"]["id"]))
         ],
         "incidents": incidents,
+        "evidence": evidence,
         "dependencies": dependents["artifacts"],
     }

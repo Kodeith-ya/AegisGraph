@@ -4,7 +4,7 @@ Turns the graph-proven Phase 3 investigation into an explainable,
 reproducible risk decision. This module only:
 
 * consumes Phase 3 graph-derived results (blast radius, affected apps,
-  production apps, incidents, propagation depth)
+  production apps, incidents, propagation depth, evidence)
 * performs bounded normalization and weighted aggregation
 * classifies risk levels
 * ranks affected applications deterministically
@@ -15,6 +15,13 @@ It performs NO graph traversal on its own except a single bounded
 Python does all scoring). No LLM, no external intelligence, no
 fabricated facts, no hardcoded artifact results.
 
+Evidence factor (Phase 5)
+-------------------------
+``risk.factors.evidence`` uses validated evidence confidence ONLY when
+real evidence exists (see ``evidence_confidence``). Missing/unavailable
+evidence is surfaced as ``status: "unknown"`` with a neutral score of 0
+— the existence of a graph edge is never treated as evidence itself.
+
 Determinism: only ``float``/``int`` arithmetic with fixed rounding (
 ``round(x, 2)`` for factors, ``int(round(x))`` for the final score).
 Ties in ranking/top-factors are broken by identifier ascending.
@@ -22,12 +29,19 @@ Ties in ranking/top-factors are broken by identifier ascending.
 WEIGHTS_EPSILON = 1e-9
 
 # Risk model: primary factors + weights. MUST sum to 1.0 (validated).
+#
+# Phase 5: a dedicated ``evidence`` factor (0.10) was added so validated
+# :Evidence confidence can contribute to the score. The original five
+# Phase 4 weights were scaled uniformly by 0.9 to make room, preserving
+# their documented ordering (production_impact remains the largest
+# factor). Evidence never replaces, invents, or inflates graph facts.
 RISK_WEIGHTS = {
-    "blast_radius": 0.25,
-    "production_impact": 0.35,
-    "propagation_depth": 0.15,
-    "incidents": 0.15,
-    "vulnerability": 0.10,
+    "blast_radius": 0.225,
+    "production_impact": 0.315,
+    "propagation_depth": 0.135,
+    "incidents": 0.135,
+    "vulnerability": 0.09,
+    "evidence": 0.10,
 }
 
 # Risk levels: (lower bound, level). A score belongs to the highest
@@ -62,6 +76,10 @@ LARGE_SURFACE_THRESHOLD = 5       # total_affected >= this => "large downstream 
 # Application priority weights (per-application, 0..100).
 APP_PRODUCTION_WEIGHT = 0.6
 APP_DISTANCE_WEIGHT = 0.4
+
+# Evidence source categories (Phase 5). Unknown/invalid source types are
+# REJECTED by validation, never silently coerced to "public".
+EVIDENCE_SOURCE_TYPES = ("synthetic", "public")
 
 
 def validate_weights(weights=None) -> dict:
@@ -115,6 +133,97 @@ def calculate_incident_score(incident_count) -> float:
     return _bounded(incident_count or 0, INCIDENT_NORMALIZER)
 
 
+# ---------------------------------------------------------------------
+# Evidence validation and aggregation (Phase 5)
+# ---------------------------------------------------------------------
+def _normalized_confidence(value):
+    """Return a validated 0.0..1.0 float, or None for malformed input.
+
+    Rejects booleans (bool is a subclass of int), non-numeric values,
+    and any value outside [0.0, 1.0] (e.g. 5, -1, 1.5).
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        conf = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not (0.0 <= conf <= 1.0):
+        return None
+    return conf
+
+
+def _valid_evidence_record(record) -> dict | None:
+    """Return a normalized evidence dict if the record is valid, else None.
+
+    Validation covers: evidence id (required non-empty string), source
+    (required non-empty string), source_type (must be known), confidence
+    (numeric, in [0.0, 1.0]). Malformed records are EXCLUDED from risk
+    contribution — the count of a graph edge is never treated as evidence.
+    """
+    if not isinstance(record, dict):
+        return None
+    eid = record.get("id")
+    source = record.get("source")
+    if not isinstance(eid, str) or not eid:
+        return None
+    if not isinstance(source, str) or not source:
+        return None
+    if record.get("source_type") not in EVIDENCE_SOURCE_TYPES:
+        return None
+    conf = _normalized_confidence(record.get("confidence"))
+    if conf is None:
+        return None
+    return {**record, "confidence": conf}
+
+
+def validate_evidence_record(record) -> dict:
+    """Raise ValueError for a malformed evidence record, else return it.
+
+    Used to hard-fail on malformed evidence in tests/validation paths so
+    malformed data can never silently influence risk.
+    """
+    valid = _valid_evidence_record(record)
+    if valid is None:
+        raise ValueError(
+            "malformed evidence record: id/source must be non-empty strings, "
+            "source_type must be one of " + ",".join(EVIDENCE_SOURCE_TYPES) +
+            ", confidence must be in [0.0, 1.0]"
+        )
+    return valid
+
+
+def evidence_confidence(evidence) -> dict:
+    """Deterministic confidence aggregation for valid supporting evidence.
+
+    Aggregation rule (documented): MAXIMUM confidence among valid records.
+    Rationale: one strong authoritative source can establish a fact
+    without being diluted by weaker records. If no valid evidence exists,
+    status is "unknown" and confidence is None — never invented.
+    """
+    confidences = [
+        valid["confidence"]
+        for record in (evidence or [])
+        for valid in [_valid_evidence_record(record)]
+        if valid is not None
+    ]
+    if confidences:
+        return {"status": "known", "confidence": max(confidences)}
+    return {"status": "unknown", "confidence": None}
+
+
+def calculate_evidence_score(evidence) -> float:
+    """Evidence factor score (0..100) from validated evidence confidence.
+
+    Returns 0.0 (neutral) when evidence is missing/unavailable; only
+    real validated confidence is ever converted to a score.
+    """
+    agg = evidence_confidence(evidence)
+    if agg["status"] == "unknown":
+        return 0.0
+    return round(agg["confidence"] * 100.0, 2)
+
+
 def _validated_severity(severity):
     """Return a normalized known severity string, or None if invalid."""
     if not isinstance(severity, str):
@@ -148,6 +257,7 @@ def calculate_factor_scores(investigation: dict, vulnerabilities=None) -> dict:
         "propagation_depth": calculate_depth_score(blast["max_propagation_depth"]),
         "incidents": calculate_incident_score(len(investigation["incidents"])),
         "vulnerability": calculate_vulnerability_score(vulns),
+        "evidence": calculate_evidence_score(investigation.get("evidence", [])),
     }
 
 
@@ -322,6 +432,7 @@ def build_risk(graph, investigation: dict, vulnerabilities: dict | None = None) 
     exposure) are surfaced with status "unknown", never fabricated.
     """
     vuln = vulnerabilities or _vulnerability_summary(graph, investigation)
+    evidence_summary = evidence_confidence(investigation.get("evidence", []))
 
     factor_scores = calculate_factor_scores(investigation, vuln["severities"])
     weights = validate_weights()
@@ -329,8 +440,14 @@ def build_risk(graph, investigation: dict, vulnerabilities: dict | None = None) 
     final_score = int(round(raw_score))
 
     statuses = {k: "complete" for k in weights}
-    if vuln["status"] != "known":
+    if vuln["status"] == "known":
+        statuses["vulnerability"] = "known"
+    else:
         statuses["vulnerability"] = "unknown"
+    if evidence_summary["status"] == "known":
+        statuses["evidence"] = "known"
+    else:
+        statuses["evidence"] = "unknown"
 
     factors = {
         k: _factor_detail(k, factor_scores[k], weights[k], statuses[k])
@@ -346,6 +463,10 @@ def build_risk(graph, investigation: dict, vulnerabilities: dict | None = None) 
         "vulnerability": {
             "status": vuln["status"],
             "severities": vuln["severities"],
+        },
+        "evidence": {
+            "status": evidence_summary["status"],
+            "confidence": evidence_summary["confidence"],
         },
     }
 

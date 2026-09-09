@@ -198,3 +198,50 @@ MERGE (dep3)-[:DEPLOYS]->(app3);
 // ---- Incidents connect directly to concrete artifacts ----
 MERGE (inc1)-[:AFFECTS]->(d1);
 MERGE (inc2)-[:AFFECTS]->(v1);
+
+// ============================================================
+// Evidence & provenance (Phase 5)
+// ============================================================
+// Every record is clearly SYNTHETIC demo data — sources are prefixed
+// "aegisgraph-demo-*". We do NOT pretend these came from NVD, OSV,
+// GitHub, Hugging Face or any other public source, and we never
+// fabricate CVEs or URLs. All records are deterministic so re-running
+// the seed is idempotent (MERGE + ON CREATE SET).
+//
+// Provenance chain example:
+//   (inc1:Incident)-[:SUPPORTED_BY]->(e1:Evidence)-[:DESCRIBES]->(d1:Dataset)
+//
+// ---- Evidence nodes ----
+MERGE (e1:Evidence {id: 'E1'})
+SET e1.title = 'Atlas Vision Dataset poisoning report (demo)',
+    e1.source = 'aegisgraph-demo-dataset',
+    e1.source_type = 'synthetic',
+    e1.confidence = 1.0,
+    e1.observed_at = '2026-08-01',
+    e1.description = 'Synthetic incident report indicating the Atlas Vision Dataset (D1) was poisoned. Demo data, not a real public source.';
+
+MERGE (e2:Evidence {id: 'E2'})
+SET e2.title = 'Atlas Tokenizers vulnerability advisory (demo)',
+    e2.source = 'aegisgraph-demo-advisory',
+    e2.source_type = 'synthetic',
+    e2.confidence = 0.9,
+    e2.observed_at = '2026-08-15',
+    e2.description = 'Synthetic advisory for the atlas-tokenizers vulnerability (V1) affecting package version PV1. Demo data, not a real public advisory.';
+
+MERGE (e3:Evidence {id: 'E3'})
+SET e3.title = 'Atlas Vision Dataset integrity scan anomalies (demo)',
+    e3.source = 'aegisgraph-demo-scan',
+    e3.source_type = 'synthetic',
+    e3.confidence = 0.8,
+    e3.observed_at = '2026-09-01',
+    e3.description = 'Synthetic integrity scan flagging anomalies in the Atlas Vision Dataset (D1). Demo data, not a real public report.';
+
+// ---- Incident -> Evidence (SUPPORTED_BY) ----
+MERGE (inc1)-[:SUPPORTED_BY]->(e1);
+MERGE (inc2)-[:SUPPORTED_BY]->(e2);
+
+// ---- Evidence -> concrete artifact (DESCRIBES) ----
+MERGE (e1)-[:DESCRIBES]->(d1);
+MERGE (e2)-[:DESCRIBES]->(v1);
+MERGE (e2)-[:DESCRIBES]->(pv1);
+MERGE (e3)-[:DESCRIBES]->(d1);

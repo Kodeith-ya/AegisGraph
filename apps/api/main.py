@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from graph.queries import investigate_artifact  # noqa: E402
+from graph.queries import evidence_for, investigate_artifact, resolve_artifact  # noqa: E402
 from graph.risk import enrich_investigation  # noqa: E402
 
 app = FastAPI(title="AegisGraph API")
@@ -71,3 +71,32 @@ def risk(
 ):
     """Deterministic risk report only (reuses the investigation engine)."""
     return _run_investigation(artifact_id, max_depth)["risk"]
+
+
+@app.get("/api/evidence/{artifact_id}")
+def evidence(artifact_id: str):
+    """Evidence + provenance for an artifact (reuses `evidence_for`).
+
+    Returns the resolved artifact and every evidence record that either
+    DESCRIBES it or SUPPORTS an incident affecting it. Unknown artifacts
+    return 404; DB failure returns 503. No evidence is synthesized here.
+    """
+    try:
+        graph = get_graph()
+        artifact = resolve_artifact(graph, artifact_id)
+        if artifact is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"artifact '{artifact_id}' not found in the graph",
+            )
+        return {
+            "artifact": artifact,
+            "evidence": evidence_for(graph, artifact_id),
+        }
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(
+            status_code=503,
+            detail="FalkorDB unavailable or evidence retrieval failed",
+        )

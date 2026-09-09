@@ -1,4 +1,4 @@
-"""Verify the AegisGraph seed graph + Phase 3 & Phase 4 queries.
+"""Verify the AegisGraph seed graph + Phase 3, 4 & 5 queries.
 
 Usage:
     python -m graph.verify      # from repo root
@@ -27,6 +27,16 @@ Executes real Cypher queries and prints PASS/FAIL for:
   19. Phase 4 R11: vulnerability unknown is neutral, not fabricated;
      known severity used from graph data
   20. Phase 4 R12: DB failure raises instead of fabricating a low score
+  21. Phase 5 E1/E2/E3/E5: Evidence nodes, SUPPORTED_BY/DESCRIBES rels,
+     valid source types
+  22. Phase 5 E4: evidence confidence in [0.0, 1.0]
+  23. Phase 5 E6: re-running seed does not duplicate evidence
+  24. Phase 5 E7: investigation returns evidence (D1, V1, PV1)
+  25. Phase 5 E8 + negative: APP_UNRELATED has NO evidence and stays zero
+  26. Phase 5 E9: evidence confidence contributes deterministically to risk
+  27. Phase 5 E10/E11: missing evidence is "unknown"; identical graph +
+     evidence -> identical risk
+  28. Phase 5 E12: malformed confidence / unknown source type rejected
 
 NOTE: R8 (unknown artifact 404) and API-level behavior (503, depth 422)
 are covered in apps/api/main.py — see README.
@@ -40,6 +50,7 @@ sys.path.insert(0, str(ROOT / "apps" / "api"))
 from .seed import main as seed_main  # noqa: E402
 
 from .queries import (  # noqa: E402
+    evidence_for,
     investigate_artifact,
     resolve_artifact,
 )
@@ -47,6 +58,10 @@ from .queries import (  # noqa: E402
 from .risk import (  # noqa: E402
     RISK_LEVELS,
     RISK_WEIGHTS,
+    EVIDENCE_SOURCE_TYPES,
+    calculate_evidence_score,
+    evidence_confidence,
+    validate_evidence_record,
     validate_weights,
     enrich_investigation,
 )
@@ -328,6 +343,198 @@ def main():
         "R12 DB failure raises (endpoint maps to 503)",
         db_err,
         "investigate_artifact must not return a low-risk result on DB failure",
+    )
+
+    print("\n--- 21. Phase 5 (E1/E2/E3/E5): evidence nodes & provenance rels ---")
+    for eid in ("E1", "E2", "E3"):
+        rows = first_column(graph, f"MATCH (e:Evidence {{id: '{eid}'}}) RETURN count(e)")
+        check(f"E1 evidence {eid} exists", rows[0][0] == 1, f"count={rows[0][0]}")
+
+    rows = first_column(
+        graph,
+        "MATCH (i:Incident)-[:SUPPORTED_BY]->(e:Evidence) "
+        "RETURN i.id, e.id ORDER BY i.id, e.id",
+    )
+    supported = {(i, e) for i, e in rows}
+    check(
+        "E2 INC1->E1, INC2->E2 SUPPORTED_BY",
+        supported == {("INC1", "E1"), ("INC2", "E2")},
+        f"got={sorted(supported)}",
+    )
+
+    rows = first_column(
+        graph,
+        "MATCH (e:Evidence)-[:DESCRIBES]->(a) RETURN e.id, labels(a)[0], a.id "
+        "ORDER BY e.id, a.id",
+    )
+    describes = {(e, a) for e, _, a in rows}
+    check(
+        "E3 DESCRIBES concrete artifacts",
+        describes == {("E1", "D1"), ("E2", "V1"), ("E2", "PV1"), ("E3", "D1")},
+        f"got={sorted(describes)}",
+    )
+
+    rows = first_column(graph, "MATCH (e:Evidence) RETURN DISTINCT e.source_type")
+    types = {r[0] for r in rows}
+    check(
+        "E5 all evidence source types valid",
+        types and types.issubset(set(EVIDENCE_SOURCE_TYPES)),
+        f"source_types={types}",
+    )
+
+    print("\n--- 22. Phase 5 (E4): evidence confidence within [0.0, 1.0] ---")
+    rows = first_column(graph, "MATCH (e:Evidence) RETURN e.id, e.confidence")
+    all_valid = all(
+        isinstance(c, (int, float)) and not isinstance(c, bool)
+        and 0.0 <= c <= 1.0
+        for _, c in rows
+    )
+    check(
+        "E4 confidence in [0,1] for every evidence node",
+        all_valid,
+        f"records={sorted((i, c) for i, c in rows)}",
+    )
+
+    print("\n--- 23. Phase 5 (E6): re-running seed does not duplicate evidence ---")
+    seed_main()
+    rows = first_column(graph, "MATCH (e:Evidence) RETURN count(e)")
+    check("E6 Evidence count still 3 after reseed", rows[0][0] == 3, f"count={rows[0][0]}")
+    rows = first_column(graph, "MATCH (e:Evidence {id: 'E1'}) RETURN count(e)")
+    check("E6 E1 still exactly 1 after reseed", rows[0][0] == 1, f"count={rows[0][0]}")
+
+    print("\n--- 24. Phase 5 (E7): investigation returns evidence ---")
+    d1 = investigate_artifact(graph, "D1")
+    d1_evidence_ids = {e["id"] for e in d1["evidence"]}
+    check(
+        "E7 D1 evidence = {E1, E3}",
+        d1_evidence_ids == {"E1", "E3"},
+        f"evidence={sorted(d1_evidence_ids)}",
+    )
+    e1 = next(e for e in d1["evidence"] if e["id"] == "E1")
+    check(
+        "E7 E1 provenance (supports INC1, describes D1)",
+        e1["supported_incidents"] == ["INC1"] and e1["described_artifacts"] == ["D1"],
+        f"prov={e1}",
+    )
+    e3 = next(e for e in d1["evidence"] if e["id"] == "E3")
+    check(
+        "E7 E3 directly describes D1 (no incident)",
+        e3["supported_incidents"] == [] and e3["described_artifacts"] == ["D1"],
+        f"prov={e3}",
+    )
+    pv1 = investigate_artifact(graph, "PV1")
+    check(
+        "E7 PV1 evidence = {E2} (describes PV1)",
+        {e["id"] for e in pv1["evidence"]} == {"E2"},
+        f"evidence={[e['id'] for e in pv1['evidence']]}",
+    )
+    v1 = investigate_artifact(graph, "V1")
+    v1_e2 = next((e for e in v1["evidence"] if e["id"] == "E2"), None)
+    check(
+        "E7 V1 evidence E2 supports INC2 and describes V1",
+        v1_e2 is not None
+        and v1_e2["supported_incidents"] == ["INC2"]
+        and "V1" in v1_e2["described_artifacts"],
+        f"prov={v1_e2}",
+    )
+
+    print("\n--- 25. Phase 5 (E8 + negative): no fabricated evidence ---")
+    unr = investigate_artifact(graph, "APP_UNRELATED")
+    check(
+        "E8 APP_UNRELATED has NO evidence",
+        unr["evidence"] == [],
+        f"evidence={unr['evidence']}",
+    )
+    check(
+        "E8 APP_UNRELATED blast radius remains zero",
+        unr["blast_radius"]["total_affected"] == 0,
+        f"total={unr['blast_radius']['total_affected']}",
+    )
+    unr_risk = enrich_investigation(graph, unr)["risk"]
+    check(
+        "E8 APP_UNRELATED risk consistent with graph facts",
+        unr_risk["score"] == 0
+        and unr_risk["factors"]["evidence"]["score"] == 0
+        and unr_risk["factors"]["evidence"]["status"] == "unknown",
+        f"score={unr_risk['score']}",
+    )
+
+    print("\n--- 26. Phase 5 (E9): evidence confidence -> deterministic risk ---")
+    d1r = enrich_investigation(graph, d1)
+    ev_factor = d1r["risk"]["factors"]["evidence"]
+    check(
+        "E9 D1 evidence factor = max confidence (1.0 -> 100)",
+        ev_factor["score"] == 100.0 and ev_factor["status"] == "known",
+        f"factor={ev_factor}",
+    )
+    check("E9 D1 evidence contribution = 100 * 0.10", ev_factor["contribution"] == 10.0,
+          f"contribution={ev_factor['contribution']}")
+    pv1r = enrich_investigation(graph, pv1)
+    pv1_ev = pv1r["risk"]["factors"]["evidence"]
+    check(
+        "E9 PV1 evidence factor = 0.9 -> 90",
+        pv1_ev["score"] == 90.0 and pv1_ev["status"] == "known",
+        f"factor={pv1_ev}",
+    )
+    agg = evidence_confidence(
+        [{"id": "X", "source": "aegisgraph-demo-dataset", "source_type": "synthetic",
+          "confidence": 0.4}, {"id": "Y", "source": "aegisgraph-demo-dataset",
+          "source_type": "synthetic", "confidence": 0.9}]
+    )
+    check("E9 max-confidence aggregation", agg == {"status": "known", "confidence": 0.9},
+          f"agg={agg}")
+
+    print("\n--- 27. Phase 5 (E10/E11): unknown evidence state + full determinism ---")
+    check(
+        "E10 risk.evidence unknown when no evidence",
+        unr_risk["evidence"] == {"status": "unknown", "confidence": None},
+        f"evidence-summary={unr_risk['evidence']}",
+    )
+    d1r2 = enrich_investigation(graph, investigate_artifact(graph, "D1"))
+    check("E11 identical graph+evidence -> identical risk", d1r["risk"] == d1r2["risk"])
+    check(
+        "E11 deterministic evidence aggregation",
+        evidence_confidence(d1["evidence"]) == evidence_confidence(d1r2["evidence"]),
+    )
+
+    print("\n--- 28. Phase 5 (E12): malformed confidence / source type rejected ---")
+    base = {"id": "X", "source": "aegisgraph-demo-dataset", "source_type": "synthetic",
+            "title": "t", "confidence": 0.9}
+    rejected = False
+    for bad_conf in (5, -1, 1.5, "high", True, None):
+        try:
+            validate_evidence_record({**base, "confidence": bad_conf})
+        except ValueError:
+            rejected = True
+        else:
+            rejected = False
+            break
+    check("E12 malformed confidence values rejected", rejected)
+
+    try:
+        validate_evidence_record({**base, "source_type": "huggingface"})
+        unknown_type_ok = False
+    except ValueError:
+        unknown_type_ok = True
+    check("E12 unknown source type rejected (not coerced to public)", unknown_type_ok)
+
+    mixed = [
+        {**base, "id": "OK", "confidence": 0.9},
+        {**base, "id": "BAD", "confidence": 1.5},
+        "not-a-dict",
+        {"id": "NOCONF"},
+    ]
+    check(
+        "E12 malformed records excluded from aggregation",
+        evidence_confidence(mixed) == {"status": "known", "confidence": 0.9}
+        and calculate_evidence_score(mixed) == 90.0,
+        f"score={calculate_evidence_score(mixed)}",
+    )
+    check(
+        "E12 all-malformed evidence -> unknown, never invented",
+        evidence_confidence([{**base, "confidence": 1.5}])
+        == {"status": "unknown", "confidence": None}
+        and calculate_evidence_score([{**base, "confidence": 1.5}]) == 0.0,
     )
 
 
