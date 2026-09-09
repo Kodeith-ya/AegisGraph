@@ -13,6 +13,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from graph.queries import investigate_artifact  # noqa: E402
+from graph.risk import enrich_investigation  # noqa: E402
 
 app = FastAPI(title="AegisGraph API")
 
@@ -31,15 +32,12 @@ def health(response: Response):
         return {"status": "error", "falkordb": "unavailable"}
 
 
-@app.get("/api/investigate/{artifact_id}")
-def investigate(artifact_id: str, max_depth: int | None = Query(default=None)):
-    """Graph-native blast-radius investigation for an AI artifact.
-
-    All affected entities, paths, and counts are computed by FalkorDB.
-    This endpoint only shapes the result.
-    """
+def _run_investigation(artifact_id: str, max_depth: int | None) -> dict:
+    """Run investigation + risk enrichment, mapping failures to HTTP errors."""
     try:
-        result = investigate_artifact(get_graph(), artifact_id, max_depth=max_depth)
+        graph = get_graph()
+        investigation = investigate_artifact(graph, artifact_id, max_depth=max_depth)
+        return enrich_investigation(graph, investigation)
     except LookupError:
         raise HTTPException(
             status_code=404,
@@ -50,4 +48,26 @@ def investigate(artifact_id: str, max_depth: int | None = Query(default=None)):
             status_code=503,
             detail="FalkorDB unavailable or investigation failed",
         )
-    return result
+
+
+@app.get("/api/investigate/{artifact_id}")
+def investigate(
+    artifact_id: str,
+    max_depth: int | None = Query(default=None, ge=1, le=20),
+):
+    """Graph-native blast-radius investigation + deterministic risk report.
+
+    All affected entities, paths, counts, factor scores, and rankings are
+    derived from FalkorDB graph facts. `max_depth` is bounded to 1..20 and
+    rejected outside that range.
+    """
+    return _run_investigation(artifact_id, max_depth)
+
+
+@app.get("/api/risk/{artifact_id}")
+def risk(
+    artifact_id: str,
+    max_depth: int | None = Query(default=None, ge=1, le=20),
+):
+    """Deterministic risk report only (reuses the investigation engine)."""
+    return _run_investigation(artifact_id, max_depth)["risk"]
