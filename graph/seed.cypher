@@ -71,6 +71,24 @@ SET pv2.name = 'atlas-validator v1.1.0',
     pv2.version = '1.1.0',
     pv2.data_source = 'synthetic';
 
+// ---- Public-intelligence fixture (Phase 6, intentionally isolated) ----
+// P3/PV3 model a real public PyPI package (pyyaml 5.3) so Phase 6 OSV
+// ingestion can map real public advisories onto an EXISTING
+// PackageVersion node. The node stays disconnected from the rest of the
+// synthetic graph: it has NO edge into or out of the D1 system, so it
+// cannot change any Phase 2/3/4/5 result or test.
+MERGE (p3:Package {id: 'P3'})
+SET p3.name = 'pyyaml',
+    p3.data_source = 'synthetic';
+
+MERGE (pv3:PackageVersion {id: 'PV3'})
+SET pv3.name = 'pyyaml 5.3',
+    pv3.version = '5.3',
+    pv3.ecosystem = 'PyPI',
+    pv3.data_source = 'synthetic';
+
+MERGE (p3)-[:HAS_VERSION]->(pv3);
+
 // ---- Agents ----
 MERGE (a1:Agent {id: 'A1'})
 SET a1.name = 'Atlas Fraud Assistant',

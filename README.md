@@ -10,6 +10,7 @@ API.
 - **Phase 3** — graph-native blast-radius investigation engine + `GET /api/investigate/{artifact_id}`.
 - **Phase 4** — deterministic risk & impact intelligence engine (`graph/risk.py`) + `GET /api/risk/{artifact_id}`.
 - **Phase 5** — evidence & provenance layer (`:Evidence`, `SUPPORTED_BY`/`DESCRIBES`, `risk.factors.evidence`) + `GET /api/evidence/{artifact_id}`.
+- **Phase 6** — public security-intelligence ingestion (`graph/osv.py`, real OSV API) with full provenance, deterministic version mapping, MERGE-idempotent upserts + a prepared-but-not-executed GraphRAG SDK integration point (`graph/graphrag_schema.py`).
 
 > If artifact X becomes unsafe, which downstream systems are affected, through which paths,
 > how severe is the impact, and what evidence supports the conclusions?
@@ -86,10 +87,12 @@ public-source attributions (Phase 5).
 ## Files
 - `graph/queries.py` — Phase 3 blast-radius investigation + Phase 5 evidence queries
 - `graph/schema.cypher` — indexes (model decisions/comments)
-- `graph/seed.cypher` — deterministic synthetic seed data (idempotent via `MERGE`)
+- `graph/seed.cypher` — deterministic synthetic seed data (idempotent via `MERGE`); incl. isolated `P3/PV3` (pyyaml 5.3) fixture for Phase 6
 - `graph/seed.py` — applies schema + seed to FalkorDB
-- `graph/verify.py` — runs traversal / negative / incident checks + Phase 3/4/5 tests
+- `graph/verify.py` — traversal / negative / incident checks + Phase 3/4/5/6 tests (Phase 6 unit checks run with NO database)
 - `graph/risk.py` — Phase 4 deterministic risk engine + Phase 5 evidence factor
+- `graph/osv.py` — Phase 6 public security-intelligence ingestion (OSV client, normalizer, version matcher, upsert plan, CLI)
+- `graph/graphrag_schema.py` — Phase 6 GraphRAG SDK integration point (ontologized, import-safe, NOT executed)
 
 ## Commands (from repo root, with FalkorDB running)
 ```
@@ -343,3 +346,78 @@ evidence/provenance records. Unknown artifact → `404`; DB failure → `503`.
 - No `inferred` source type yet (not needed by the schema).
 - `risk.factors.evidence` cannot exceed 100 and is neutral (`0`) when evidence is
   missing — absence never inflates risk.
+
+## Public Security Intelligence Ingestion (Phase 6)
+
+`graph/osv.py` brings REAL public advisories into the graph with full provenance, for a
+deliberately tiny deterministic subset (PyPI `pyyaml`). Structured OSV JSON needs no LLM:
+a deterministic normalizer plays the role GraphRAG would otherwise take.
+
+```
+OSV API (public) -> fetch -> validate/normalize -> CVE dedupe
+   -> PEP 440 version mapping -> upsert plan -> FalkorDB MERGE (idempotent)
+   -> public :Evidence + DESCRIBES + :Vulnerability (source='osv') -> HAS_VULNERABILITY
+```
+
+### Trust & provenance invariants (Phase 6)
+- **Nothing is fabricated.** Severity only from OSV/GitHub `database_specific.severity`
+  (aliased `CRITICAL→critical`, etc.); CVE ids only from OSV `aliases`; confidence is
+  `None` because **OSV defines no per-record confidence** (never invented).
+- **Deterministic version mapping only.** A `PackageVersion` is linked via
+  `HAS_VULNERABILITY` ONLY when its version is exactly in the OSV affected `versions`
+  list (`mapping_method = "exact_package_version"`) or inside the OSV ECOSYSTEM range
+  using official PEP 440 semantics (`"ecosystem_range"`, `introduced <= v < fixed`).
+  Out-of-range versions produce **no edge** (reported in `plan.unmatched`).
+- **CVE-aware dedupe.** OSV returns a GHSA **and** a PySEC copy for the same CVE; the
+  record with a known severity wins, so one CVE = one `:Vulnerability` node.
+- **Upsert, never duplicate.** Every write is a `MERGE` + `SET`; re-running yields
+  `0 creates / N updates`.
+- **No auto-incidents.** A vulnerability is not an incident — ingestion never creates
+  `:Incident` nodes.
+- **Failure isolation.** An OSV/network failure is recorded in the report and **never
+  modifies** existing graph data; investigation/risk keep working.
+- No API ingestion endpoint exists: ingestion is a reviewed CLI/build-pipeline step.
+
+Public records enter the graph as `:Vulnerability {source:'osv', data_source:'public'}`
+plus a matching `:Evidence {id:'OSV-<id>', source:'osv', source_type:'public',
+confidence:None}` with `DESCRIBES` edges — so `GET /api/evidence/{id}` and investigations
+carry the provenance, and the risk engine's `vulnerability` factor consumes the real
+severity while the `evidence` factor stays neutral (`confidence` unknown, never inflated).
+
+### Seeded mapping target
+`seed.cypher` adds an isolated `P3/PV3` (`pyyaml 5.3`, ecosystem `PyPI`); PV3 has **no
+edges** into the D1 system, so all Phase 2/3/4/5 results and tests are unchanged.
+
+### Live expectations for `pyyaml 5.3` (validated against the real OSV API)
+| CVE | OSV records | 5.3 mapping |
+|-----|-------------|-------------|
+| CVE-2020-1747 | GHSA-6757-jp84-gxfx (+ PYSEC-2020-96) | ✓ exact_package_version |
+| CVE-2020-14343 | GHSA-8q59-q68h-6hv4 (+ PYSEC-2021-142) | ✓ exact_package_version |
+| CVE-2019-20477 | GHSA-3pqx-4fqf-j49f (+ PYSEC-2020-176) | ✗ out-of-range (≥ 5.2) |
+| CVE-2017-18342 | GHSA-rprw-h62v-c2w7 (+ PYSEC-2018-49) | ✗ out-of-range (≥ 5.1) |
+
+### Commands
+```
+# plan against live OSV without touching the database (works with NO FalkorDB)
+python -m graph.osv --dry-run
+
+# full ingestion (needs FalkorDB + seed P3/PV3 applied)
+python -m graph.osv
+```
+
+### GraphRAG SDK (prepared, not executed)
+`graph/graphrag_schema.py` documents the AegisGraph ontology (`Vulnerability`,
+`Package`, `PackageVersion`, `Evidence`, `Incident` + `HAS_VULNERABILITY`/`DESCRIBES`)
+and `build_graphrag_schema()` returns a FalkorDB/GraphRAG-SDK `GraphSchema` **only** when
+the SDK is installed. It requires a live FalkorDB and an LLM/embedder via LiteLLM —
+neither exists in this environment, so the SDK is **not installed and not executed**.
+Structured OSV JSON is normalized deterministically instead; GraphRAG is a future option
+for unstructured advisories only.
+
+### Verification
+- Unit checks (P1–P5, P7–P9, P13, P14) — OSV fetch contract, validation, normalization,
+  CVE dedupe, version-mapping matrix, plan integrity/idempotency, dry-run no-op,
+  orchestration + failure isolation, determinism — run with **no database**:
+  `python -m graph.verify` (auto-degrades to unit-only mode when FalkorDB is down).
+- Integration checks (P6, P10–P12) — live OSV ingestion, upsert detection,
+  post-ingestion provenance/risk, failure isolation — require a running FalkorDB.

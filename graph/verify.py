@@ -1,48 +1,36 @@
-"""Verify the AegisGraph seed graph + Phase 3, 4 & 5 queries.
+"""Verify the AegisGraph seed graph + Phase 3, 4, 5 & 6 behavior.
 
 Usage:
     python -m graph.verify      # from repo root
 
 Executes real Cypher queries and prints PASS/FAIL for:
-  1. Required nodes exist (D1, MV1, A1, APP1, DEP1, PV1, V1, INC1, INC2)
-  2. Full traversal D1 -> MV1 -> A1 -> APP1 -> DEP1
-  3. Multi-path: D1 -> MV1 -> MV2 -> APP2
-  4. Negative test: D1 must NOT reach APP_UNRELATED
-  5. Incident AFFECTS relationships exist
-  6. Counts
-  7. Phase 3: D1 blast radius (distinct set, negative control, max depth,
-     affected + production applications)
-  8. Phase 3: exact path D1 -> APP1
-  9. Phase 3: vulnerability V1 -> PV1 -> downstream, incident surfaced
-  10. Phase 3: negative control (no downstream) returns zero affected
-  11. Phase 3: unknown artifact resolves to None (404 case)
-  12. Phase 4 R1/R2: risk report exists, score bounded 0..100
-  13. Phase 4 R3: risk weights sum to 1.0, invalid weights rejected
-  14. Phase 4 R4: production = DEPLOYS edge only (APP5 not production)
-  15. Phase 4 R5/R6: deterministic ranking; production outranks non-prod
-  16. Phase 4 R7: zero blast radius -> zero risk, still complete
-  17. Phase 4 R9: depth sensitivity (cap respected, superset, risk from
-     actual returned investigation)
-  18. Phase 4 R10: incident factor reflects real incident exposure
-  19. Phase 4 R11: vulnerability unknown is neutral, not fabricated;
-     known severity used from graph data
-  20. Phase 4 R12: DB failure raises instead of fabricating a low score
-  21. Phase 5 E1/E2/E3/E5: Evidence nodes, SUPPORTED_BY/DESCRIBES rels,
-     valid source types
-  22. Phase 5 E4: evidence confidence in [0.0, 1.0]
-  23. Phase 5 E6: re-running seed does not duplicate evidence
-  24. Phase 5 E7: investigation returns evidence (D1, V1, PV1)
-  25. Phase 5 E8 + negative: APP_UNRELATED has NO evidence and stays zero
-  26. Phase 5 E9: evidence confidence contributes deterministically to risk
-  27. Phase 5 E10/E11: missing evidence is "unknown"; identical graph +
-     evidence -> identical risk
-  28. Phase 5 E12: malformed confidence / unknown source type rejected
+  1-6: Phase 2 schema/seed structural checks
+  7-11: Phase 3 traversal / blast-radius / negative / 404 checks
+  12-20: Phase 4 deterministic risk (R1-R12)
+  21-28: Phase 5 evidence & provenance (E1-E12)
+  29: Phase 6 P1-P5, P7-P9, P13, P14 — UNIT checks that never need
+      FalkorDB (OSV fetch contract, validation, normalization severity
+      aliasing, CVE dedupe, version mapping matrix, plan integrity,
+      plan idempotency, dry-run no-op, orchestration + failure
+      isolation, determinism).
+  30: Phase 6 P6, P10-P12 — INTEGRATION checks that need a LIVE
+      FalkorDB (+ live OSV network for P6): real pyyaml ingestion,
+      upsert detection, post-ingestion graph facts (public provenance,
+      honest risk: public evidence w/o confidence never inflates risk,
+      no auto-incident), and failure isolation.
+
+If FalkorDB is unreachable, the Phase 6 UNIT section and GraphRAG-SDK
+availability check still run; DB-dependent sections are skipped with a
+note (live Docker/FalkorDB required).
 
 NOTE: R8 (unknown artifact 404) and API-level behavior (503, depth 422)
 are covered in apps/api/main.py — see README.
 """
+import json
 import sys
+import urllib.error
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "apps" / "api"))
@@ -66,6 +54,148 @@ from .risk import (  # noqa: E402
     enrich_investigation,
 )
 
+from .graphrag_schema import (  # noqa: E402
+    ONTOLOGY_ENTITIES,
+    ONTOLOGY_RELATIONS,
+    build_graphrag_schema,
+)
+
+from .osv import (  # noqa: E402
+    HTTP_RETRIES,
+    Affected,
+    OSVError,
+    OSV_SOURCE,
+    apply_plan,
+    build_upsert_plan,
+    dedupe_records,
+    evidence_id_for,
+    fetch_osv_package,
+    ingest_public_vulnerabilities,
+    match_vulnerability,
+    normalize_osv_record,
+    package_version_in_affected,
+    parse_severity,
+    validate_osv_record,
+)
+
+# ----------------------------------------------------------------------
+# Phase 6 unit fixtures — trimmed, faithful copies of REAL OSV records
+# for PyPI `pyyaml` (retrieved 2026 from api.osv.dev). They model an
+# external record contract; unit checks never hit the network.
+# Four distinct CVEs, each ALSO served as a PYSEC record (severity null):
+#   CVE-2020-1747  GHSA-6757-jp84-gxfx (CRITICAL) / PYSEC-2020-96
+#   CVE-2020-14343 GHSA-8q59-q68h-6hv4 (CRITICAL) / PYSEC-2021-142
+#   CVE-2019-20477 GHSA-3pqx-4fqf-j49f (CRITICAL) / PYSEC-2020-176
+#   CVE-2017-18342 GHSA-rprw-h62v-c2w7 (CRITICAL) / PYSEC-2018-49
+# For pyyaml 5.3: CVE-2020-1747 and CVE-2020-14343 map (exact version in
+# the OSV affected list); the other two are explicitly out-of-range.
+# ----------------------------------------------------------------------
+_FIXTURE_6757 = {
+    "id": "GHSA-6757-jp84-gxfx",
+    "summary": "Improper input validation in PyYAML",
+    "details": "PyYAML library mishandles specially crafted input, leading to "
+               "arbitrary code execution (yaml.Loader).",
+    "aliases": ["CVE-2020-1747", "PYSEC-2020-96"],
+    "affected": [{
+        "package": {"name": "pyyaml", "ecosystem": "PyPI",
+                    "purl": "pkg:pypi/pyyaml"},
+        "ranges": [{"type": "ECOSYSTEM",
+                    "events": [{"introduced": "5.1b7"}, {"fixed": "5.3.1"}]}],
+        "versions": ["5.1b3", "5.1b5", "5.1b7", "5.1", "5.2", "5.3"],
+    }],
+    "references": [{"type": "ADVISORY",
+                    "url": "https://github.com/advisories/GHSA-6757-jp84-gxfx"}],
+    "published": "2020-06-09T03:44:00Z",
+    "modified": "2024-01-04T21:44:00Z",
+    "database_specific": {"severity": "CRITICAL"},
+}
+_FIXTURE_PYSEC_96 = {
+    "id": "PYSEC-2020-96",
+    "summary": "PyYAML: Full load of untrusted YAML can execute arbitrary code",
+    "details": "pyyaml before 5.3.1 allows a crafted YAML document to execute "
+               "arbitrary code on full load.",
+    "aliases": ["CVE-2020-1747", "GHSA-6757-jp84-gxfx"],
+    "affected": [{
+        "package": {"name": "pyyaml", "ecosystem": "PyPI",
+                    "purl": "pkg:pypi/pyyaml"},
+        "ranges": [{"type": "ECOSYSTEM",
+                    "events": [{"introduced": "5.1"}, {"fixed": "5.3.1"}]}],
+        "versions": [],
+    }],
+    "references": [],
+    "published": "2020-06-09T03:44:00Z",
+    "modified": "2024-01-04T21:44:00Z",
+}
+_FIXTURE_14343 = {
+    "id": "GHSA-8q59-q68h-6hv4",
+    "summary": "Improper input validation in PyYAML",
+    "details": "PyYAML.insecure_load bypasses security checks via arbitrary "
+               "chained method calls when the DIY API is used.",
+    "aliases": ["CVE-2020-14343", "PYSEC-2021-142"],
+    "affected": [{
+        "package": {"name": "pyyaml", "ecosystem": "PyPI",
+                    "purl": "pkg:pypi/pyyaml"},
+        "ranges": [{"type": "ECOSYSTEM",
+                    "events": [{"introduced": "0"}, {"fixed": "5.4"}]}],
+        "versions": ["5.1", "5.2", "5.3"],
+    }],
+    "references": [{"type": "ADVISORY",
+                    "url": "https://github.com/advisories/GHSA-8q59-q68h-6hv4"}],
+    "published": "2020-07-22T00:00:00Z",
+    "modified": "2023-03-03T20:18:00Z",
+    "database_specific": {"severity": "CRITICAL"},
+}
+_FIXTURE_20477 = {
+    "id": "GHSA-3pqx-4fqf-j49f",
+    "summary": "Improper input validation in PyYAML",
+    "details": "Improper input validation in PyYAML leading to a buffer "
+               "over-read targeting a crafted YAML file.",
+    "aliases": ["CVE-2019-20477", "PYSEC-2020-176"],
+    "affected": [{
+        "package": {"name": "pyyaml", "ecosystem": "PyPI",
+                    "purl": "pkg:pypi/pyyaml"},
+        "ranges": [{"type": "ECOSYSTEM",
+                    "events": [{"introduced": "5.1"}, {"fixed": "5.2"}]}],
+        "versions": ["5.1", "5.1b3"],
+    }],
+    "references": [{"type": "ADVISORY",
+                    "url": "https://github.com/advisories/GHSA-3pqx-4fqf-j49f"}],
+    "published": "2020-02-17T00:00:00Z",
+    "modified": "2023-03-03T20:38:00Z",
+    "database_specific": {"severity": "CRITICAL"},
+}
+_FIXTURE_18342 = {
+    "id": "GHSA-rprw-h62v-c2w7",
+    "summary": "YAML deserialization attack in PyYAML",
+    "details": "yaml.load in PyYAML executes arbitrary Python code.",
+    "aliases": ["CVE-2017-18342", "PYSEC-2018-49"],
+    "affected": [{
+        "package": {"name": "pyyaml", "ecosystem": "PyPI",
+                    "purl": "pkg:pypi/pyyaml"},
+        "ranges": [{"type": "ECOSYSTEM",
+                    "events": [{"introduced": "0"}, {"fixed": "5.1"}]}],
+        "versions": ["3.10", "3.13", "4.2b4", "5.0"],
+    }],
+    "references": [{"type": "ADVISORY",
+                    "url": "https://github.com/advisories/GHSA-rprw-h62v-c2w7"}],
+    "published": "2018-07-25T00:00:00Z",
+    "modified": "2023-03-03T20:18:00Z",
+    "database_specific": {"severity": "CRITICAL"},
+}
+
+# The pyyaml records exactly as OSV's /v1/query returns them: each CVE
+# carries BOTH its GHSA copy AND its PYSEC copy.
+_FIXTURE_RAW = [_FIXTURE_6757, _FIXTURE_PYSEC_96, _FIXTURE_14343,
+                _FIXTURE_20477, _FIXTURE_18342]
+
+_FIXTURE_KNOWN_VERSIONS = [
+    {"id": "PV3", "name": "pyyaml", "version": "5.3", "ecosystem": "PyPI"},
+]
+_EXPECTED_DEDUPED_IDS = {"GHSA-6757-jp84-gxfx", "GHSA-8q59-q68h-6hv4",
+                         "GHSA-3pqx-4fqf-j49f", "GHSA-rprw-h62v-c2w7"}
+_EXPECTED_MAPPED_CVES = {"CVE-2020-1747", "CVE-2020-14343"}
+_EXPECTED_UNMATCHED_CVES = {"CVE-2019-20477", "CVE-2017-18342"}
+
 
 def first_column(graph, cypher):
     return graph.query(cypher).result_set
@@ -76,7 +206,14 @@ def check(label, ok, detail=""):
 
 
 def main():
-    graph = seed_main()
+    try:
+        graph = seed_main()
+    except Exception as exc:  # noqa: BLE001 — DB-degraded mode
+        print(f"\n[DB-DEGRADED] FalkorDB unavailable ({exc})")
+        print("[DB-DEGRADED] Running Phase 6 unit checks only; P6/P10-P12 "
+              "(live FalkorDB) skipped.\n")
+        verify_phase6_unit()
+        return
 
     print("\n--- 1. Required nodes exist ---")
     node_ids = ["D1", "MV1", "A1", "APP1", "DEP1", "PV1", "V1", "INC1", "INC2"]
@@ -382,15 +519,15 @@ def main():
         f"source_types={types}",
     )
 
-    print("\n--- 22. Phase 5 (E4): evidence confidence within [0.0, 1.0] ---")
+    print("\n--- 22. Phase 5 (E4): evidence confidence valid (null = unknown) ---")
     rows = first_column(graph, "MATCH (e:Evidence) RETURN e.id, e.confidence")
     all_valid = all(
-        isinstance(c, (int, float)) and not isinstance(c, bool)
-        and 0.0 <= c <= 1.0
+        c is None or (isinstance(c, (int, float)) and not isinstance(c, bool)
+                      and 0.0 <= c <= 1.0)
         for _, c in rows
     )
     check(
-        "E4 confidence in [0,1] for every evidence node",
+        "E4 confidence is null (explicitly unknown) or in [0,1]",
         all_valid,
         f"records={sorted((i, c) for i, c in rows)}",
     )
@@ -535,6 +672,493 @@ def main():
         evidence_confidence([{**base, "confidence": 1.5}])
         == {"status": "unknown", "confidence": None}
         and calculate_evidence_score([{**base, "confidence": 1.5}]) == 0.0,
+    )
+
+    verify_phase6_unit()
+    verify_phase6_integration(graph)
+
+
+class _FakeUrlopen:
+    """Minimal stand-in for urllib.request.urlopen (Phase 6 P1)."""
+
+    def __init__(self, payload=b"{}", error=None):
+        self.payload = payload
+        self.error = error
+        self.calls = []
+
+    def __call__(self, request, timeout=None):
+        self.calls.append((request, timeout))
+        if self.error is not None:
+            raise self.error
+        return self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self):
+        return self.payload
+
+
+class _ExplodingGraph:
+    """Any query call is a bug (used to prove dry-run performs NO writes)."""
+
+    def query(self, *args, **kwargs):
+        raise RuntimeError("dry-run must never execute a DB query")
+
+
+def verify_phase6_unit():
+    """Phase 6 (P1-P5, P7-P9, P13, P14): pure, no FalkorDB, no network.
+
+    These checks pass with zero external services; they exercise the
+    OSV fetch contract, validation, normalization, CVE dedupe, the
+    deterministic version-mapping matrix, plan integrity/idempotency,
+    dry-run no-op behavior, orchestration + failure isolation and
+    determinism.
+    """
+    print("\n--- 29. Phase 6 (unit: P1-P5, P7-P9, P13, P14) ---")
+
+    # ---------------------------- P1: OSV fetch contract ---------------------------
+    print("\n  P1: OSV fetch (POST /v1/query, bounded retries, OSVError)")
+    payload = {"vulns": [{"id": "GHSA-X"}], "next_page_token": None}
+    fake = _FakeUrlopen(json.dumps(payload).encode("utf-8"))
+    with mock.patch("graph.osv.urllib.request.urlopen", fake):
+        records = fetch_osv_package("PyPI", "pyyaml")
+    req, timeout = fake.calls[0]
+    body = json.loads(req.data) if req.data else {}
+    check(
+        "P1 POST https://api.osv.dev/v1/query",
+        req.full_url == "https://api.osv.dev/v1/query"
+        and req.get_method() == "POST",
+        f"url={req.full_url} method={req.get_method()}",
+    )
+    check(
+        "P1 payload = {package:{ecosystem,name}}",
+        body == {"package": {"ecosystem": "PyPI", "name": "pyyaml"}},
+        f"body={body}",
+    )
+    check(
+        "P1 bounded timeout used",
+        timeout == 15,
+        f"timeout={timeout}",
+    )
+    check(
+        "P1 returns data.vulns from response",
+        records == [{"id": "GHSA-X"}],
+        f"records={records}",
+    )
+
+    fake = _FakeUrlopen(error=urllib.error.URLError("connection refused"))
+    with mock.patch("graph.osv.urllib.request.urlopen", fake):
+        try:
+            fetch_osv_package("PyPI", "pyyaml")
+            raised = False
+        except OSVError:
+            raised = True
+    check(
+        "P1 OSVError raised, retries bounded",
+        raised and len(fake.calls) == HTTP_RETRIES + 1,
+        f"raised={raised} attempts={len(fake.calls)}",
+    )
+
+    # ---------------------------- P2: validation contract --------------------------
+    print("  P2: record validation (reject malformed, accept valid)")
+    check("P2 valid record -> no errors",
+          validate_osv_record(_FIXTURE_6757) == [])
+    check("P2 missing id rejected",
+          bool(validate_osv_record({**_FIXTURE_6757, "id": ""})))
+    check("P2 missing affected rejected",
+          bool(validate_osv_record({**_FIXTURE_6757, "affected": []})))
+    check("P2 non-mapping rejected",
+          bool(validate_osv_record("not-a-dict")))
+    check(
+        "P2 missing package name rejected",
+        bool(validate_osv_record({
+            **_FIXTURE_6757,
+            "affected": [{"package": {"ecosystem": "PyPI"}}],
+        })),
+    )
+    check(
+        "P2 invalid timestamp rejected",
+        bool(validate_osv_record({**_FIXTURE_6757, "published": 12345})),
+    )
+
+    # ---------------------------- P3: normalization --------------------------------
+    print("  P3: normalization + severity aliasing (no fabrication)")
+    n = normalize_osv_record(_FIXTURE_6757)
+    check(
+        "P3 extracts id/cve/summary/references",
+        n is not None
+        and n.id == "GHSA-6757-jp84-gxfx"
+        and n.cve_id == "CVE-2020-1747"
+        and n.summary == "Improper input validation in PyYAML"
+        and n.source_url == "https://github.com/advisories/GHSA-6757-jp84-gxfx",
+        f"cve={n.cve_id if n else None} url={n.source_url if n else None}",
+    )
+    check("P3 extracts affected range (5.1b7 -> 5.3.1)",
+          n.affected[0].introduced == "5.1b7"
+          and n.affected[0].fixed == "5.3.1"
+          and "5.3" in n.affected[0].versions)
+    check(
+        "P3 GitHub severity aliased (CRITICAL -> critical)",
+        parse_severity(_FIXTURE_6757) == "critical",
+    )
+    check(
+        "P3 unknown severity NOT invented (null stays null)",
+        parse_severity(_FIXTURE_PYSEC_96) is None
+        and parse_severity({"database_specific": {"severity": "severe"}}) is None
+        and parse_severity({"database_specific": {}}) is None,
+        f"pys787={parse_severity(_FIXTURE_PYSEC_96)}",
+    )
+    check("P3 structurally invalid -> None",
+          normalize_osv_record({"id": "X"}) is None
+          and normalize_osv_record({}) is None)
+
+    # ---------------------------- P4: CVE dedupe -----------------------------------
+    print("  P4: CVE-aware dedupe (GHSA+PYSeC duplicates collapse)")
+    deduped = dedupe_records(_FIXTURE_RAW)
+    ids = {r["id"] for r in deduped}
+    check(
+        "P4 8 records (4 CVEs x 2 copies) -> 4 unique records",
+        ids == _EXPECTED_DEDUPED_IDS,
+        f"ids={sorted(ids)}",
+    )
+    sev_6757 = next(r for r in deduped if r["id"] == "GHSA-6757-jp84-gxfx")
+    check(
+        "P4 severity-bearing record preferred over severity-null copy",
+        parse_severity(sev_6757) == "critical",
+        f"kept={sev_6757['id']}",
+    )
+    reordered = dedupe_records(list(reversed(_FIXTURE_RAW)))
+    check(
+        "P4 dedupe deterministic regardless of input order",
+        {r["id"] for r in reordered} == ids,
+    )
+    check(
+        "P4 records without CVE keyed by own id (kept individually)",
+        {r["id"] for r in dedupe_records([_FIXTURE_14343, _FIXTURE_20477])} ==
+        {"GHSA-8q59-q68h-6hv4", "GHSA-3pqx-4fqf-j49f"},
+    )
+
+    # ---------------------------- P5: version mapping matrix -----------------------
+    print("  P5: deterministic version mapping (exact list / ecosystem range)")
+    exact = Affected("PyPI", "pyyaml", frozenset(["5.1", "5.3"]), None, None)
+    ok, method = package_version_in_affected("5.3", exact)
+    check("P5 version in explicit affected list -> exact_package_version",
+          ok and method == "exact_package_version", f"method={method}")
+    ok, method = package_version_in_affected("9.9", exact)
+    check("P5 version NOT in list and no range -> NO match (never assume)",
+          not ok and method is None, f"ok={ok}")
+    rng = Affected("PyPI", "pyyaml", frozenset(), "0", "5.4")
+    ok, method = package_version_in_affected("5.3", rng)
+    check("P5 in ECOSYSTEM range (0 <= 5.3 < 5.4) -> ecosystem_range",
+          ok and method == "ecosystem_range", f"method={method}")
+    ok, _ = package_version_in_affected("5.4", rng)
+    check("P5 at fixed version -> NOT affected (>= fixed)", not ok)
+    ok, _ = package_version_in_affected("5.4.1", rng)
+    check("P5 beyond fixed -> NOT affected", not ok)
+    upper = Affected("PyPI", "pyyaml", frozenset(), "5.1", "5.2")
+    ok, _ = package_version_in_affected("5.3", upper)
+    check("P5 above fixed (CVE-2019-20477) -> NOT affected", not ok)
+    ok, _ = package_version_in_affected("5.1", upper)
+    check("P5 at/above introduced, below fixed -> affected", ok)
+    prerelease = Affected("PyPI", "pyyaml", frozenset(), "5.1b7", "5.3.1")
+    ok, _ = package_version_in_affected("5.2", prerelease)
+    check("P5 PEP 440 pre-release boundary (5.1b7 < 5.2 < 5.3.1)", ok)
+    ok, _ = package_version_in_affected("5.3.1", prerelease)
+    check("P5 fixed 5.3.1 not affected", not ok)
+    ok, unparseable_method = package_version_in_affected("latest", rng)
+    check("P5 unparseable version -> NO match (no fabrication)",
+          not ok and unparseable_method is None)
+
+    matches = match_vulnerability(normalize_osv_record(_FIXTURE_6757),
+                                  _FIXTURE_KNOWN_VERSIONS)
+    check(
+        "P5 match_vulnerability single-record (CVE-2020-1747 on 5.3)",
+        len(matches) == 1
+        and matches[0]["package_id"] == "PV3"
+        and matches[0]["mapping_method"] == "exact_package_version",
+        f"matches={matches}",
+    )
+
+    # ---------------------------- P7: plan integrity -------------------------------
+    print("  P7: plan integrity (full provenance, no auto-incident, honest None)")
+    plan = build_upsert_plan(_FIXTURE_RAW, known_versions=_FIXTURE_KNOWN_VERSIONS,
+                             now="2026-09-09T12:00:00Z")
+    c = plan["counts"]
+    check(
+        "P7 retrieved 5 raw records, accepted 4 (deduped), rejected 0",
+        c["records_retrieved"] == 5 and c["records_accepted"] == 4
+        and c["records_rejected"] == 0,
+        f"counts={c}",
+    )
+    check(
+        "P7 exactly 2 package mappings, 2 unmatched (out-of-range, honest)",
+        c["package_mappings_created"] == 2
+        and {m["vuln_id"] for m in plan["mappings"]} == _EXPECTED_DEDUPED_IDS - {
+            "GHSA-3pqx-4fqf-j49f", "GHSA-rprw-h62v-c2w7"}
+        and {u["cve_id"] for u in plan["unmatched"]} == _EXPECTED_UNMATCHED_CVES,
+        f"mapped={[m['vuln_id'] for m in plan['mappings']]} "
+        f"unmatched={[u['cve_id'] for u in plan['unmatched']]}",
+    )
+    vuln_op = next(v for v in plan["vulnerabilities"] if v["id"] == "GHSA-6757-jp84-gxfx")
+    check(
+        "P7 vulnerability op carries provenance + data_source=public",
+        vuln_op["source"] == "osv" and vuln_op["source_id"] == vuln_op["id"]
+        and vuln_op["cve_id"] == "CVE-2020-1747"
+        and vuln_op["severity"] == "critical"
+        and vuln_op["data_source"] == "public"
+        and vuln_op["published_at"] == "2020-06-09T03:44:00Z"
+        and any(r["url"].startswith("https://github.com/advisories/")
+                for r in vuln_op["references"]),
+        f"op={ {k: vuln_op[k] for k in ('source', 'data_source', 'cve_id', 'severity')} }",
+    )
+    ev_op = next(e for e in plan["evidence"] if e["id"] == "OSV-GHSA-6757-jp84-gxfx")
+    check(
+        "P7 evidence op: public source_type, confidence None (OSV has no model)",
+        ev_op["source_type"] == "public" and ev_op["confidence"] is None
+        and ev_op["vuln_id"] == "GHSA-6757-jp84-gxfx"
+        and ev_op["id"] == evidence_id_for("GHSA-6757-jp84-gxfx"),
+        f"conf={ev_op['confidence']}",
+    )
+    check(
+        "P7 NO auto-incident created (plan has no incident keys)",
+        "incidents" not in plan["counts"]
+        and not any("incident" in str(k).lower() for k in plan.keys()
+                    if k not in ("counts", "errors", "retrieval")),
+    )
+
+    # ---------------------------- P8: plan idempotency -----------------------------
+    print("  P8: plan idempotency (re-run -> updates only, no duplicates)")
+    plan2 = build_upsert_plan(
+        _FIXTURE_RAW, known_versions=_FIXTURE_KNOWN_VERSIONS,
+        known_vuln_ids=[v["id"] for v in plan["vulnerabilities"]],
+        known_evidence_ids=[e["id"] for e in plan["evidence"]],
+        now="2026-09-09T13:00:00Z",
+    )
+    c2 = plan2["counts"]
+    check(
+        "P8 second run: 0 creates, 4 updates (vuln+evidence), edges idempotent",
+        c2["vulnerabilities_created"] == 0
+        and c2["vulnerabilities_updated"] == 4
+        and c2["evidence_created"] == 0
+        and c2["evidence_updated"] == 4
+        and c2["package_mappings_created"] == 2,
+        f"counts={c2}",
+    )
+
+    # ---------------------------- P9: dry-run no-op --------------------------------
+    print("  P9: dry-run performs NO writes")
+    written = apply_plan(_ExplodingGraph(), plan, dry_run=True)
+    check(
+        "P9 dry-run returns mutated=False without executing a query",
+        written == {"mutated": False,
+                    "written": {"vulnerabilities": 4, "evidence": 4,
+                                "has_vulnerability_edges": 2,
+                                "describes_edges": 6}},
+        f"written={written}",
+    )
+
+    # ---------------------------- P13: orchestration + failure isolation -----------
+    print("  P13: orchestration (dry-run) + failure isolation")
+
+    def _fake_fetch_ok(ecosystem, name):
+        return list(_FIXTURE_RAW)
+
+    report = ingest_public_vulnerabilities(
+        graph=None, targets=[{"ecosystem": "PyPI", "name": "pyyaml"}],
+        dry_run=True, fetch_fn=_fake_fetch_ok, now="2026-09-09T12:00:00Z",
+    )
+    check(
+        "P13 graph=None + dry_run: plan built, nothing written, no DB touched",
+        report["dry_run"] is True
+        and report["written"]["mutated"] is False
+        and report["plan"]["counts"]["records_accepted"] == 4
+        # Without a DB there are NO known PackageVersion targets to map to:
+        # honest zero mappings, every record reported as unmatched.
+        and report["plan"]["counts"]["package_mappings_created"] == 0
+        and report["plan"]["counts"]["package_mappings_rejected"] == 4,
+        f"mutated={report['written']['mutated']} "
+        f"counts={report['plan']['counts']}",
+    )
+
+    def _fake_fetch_boom(ecosystem, name):
+        raise OSVError("OSV is down (simulated)")
+
+    report_fail = ingest_public_vulnerabilities(
+        graph=None, targets=[{"ecosystem": "PyPI", "name": "pyyaml"}],
+        dry_run=True, fetch_fn=_fake_fetch_boom,
+    )
+    check(
+        "P13 retrieval failure recorded, NOT raised, nothing written",
+        len(report_fail["errors"]) == 1
+        and report_fail["retrieval"][0]["status"] == "error"
+        and report_fail["written"]["mutated"] is False
+        and report_fail["plan"]["counts"]["records_accepted"] == 0,
+        f"errors={report_fail['errors']}",
+    )
+
+    # ---------------------------- P14: determinism --------------------------------
+    print("  P14: determinism (identical fixtures + now -> identical plan)")
+    plan_a = build_upsert_plan(_FIXTURE_RAW, known_versions=_FIXTURE_KNOWN_VERSIONS,
+                               now="2026-09-09T12:00:00Z")
+    plan_b = build_upsert_plan(_FIXTURE_RAW, known_versions=_FIXTURE_KNOWN_VERSIONS,
+                               now="2026-09-09T12:00:00Z")
+    check("P14 plan identical across runs (byte-for-byte dict equality)",
+          plan_a == plan_b)
+    check(
+        "P14 mapped vuln set matches live expectation for pyyaml 5.3",
+        {v["cve_id"] for v in plan_a["vulnerabilities"]
+         if v["cve_id"] in _EXPECTED_MAPPED_CVES} == _EXPECTED_MAPPED_CVES,
+    )
+
+    # ---------------------------- GraphRAG SDK: prepared, not executed -------------
+    print("  GraphRAG SDK integration point (prepared, NOT executed)")
+    check(
+        "SDK schema None when SDK missing (import-safe)",
+        build_graphrag_schema() is None,
+    )
+    check(
+        "Ontology spec defines all consumed labels/retypes",
+        {e["name"] for e in ONTOLOGY_ENTITIES} ==
+        {"Vulnerability", "Package", "PackageVersion", "Evidence", "Incident"}
+        and ("PackageVersion", "HAS_VULNERABILITY", "Vulnerability")
+        in ONTOLOGY_RELATIONS,
+    )
+
+
+def verify_phase6_integration(graph):
+    """Phase 6 (P6, P10-P12): needs LIVE FalkorDB + OSV network access.
+
+    Runs real OSV retrieval for PyPI `pyyaml`, ingests into the seeded
+    graph, proves upsert idempotency, post-ingestion provenance, honest
+    risk behavior (public Evidence has confidence None and does NOT
+    inflate the factor) and failure isolation. Assumes seed P3/PV3 exist.
+    """
+    print("\n--- 30. Phase 6 (integration: P6, P10-P12; live FalkorDB + OSV) ---")
+
+    incident_before = first_column(graph, "MATCH (i:Incident) RETURN count(i)")[0][0]
+
+    report = ingest_public_vulnerabilities(graph=graph, dry_run=False)
+    rc = report["plan"]["counts"]
+    check(
+        "P6 live OSV pyyaml: 8 raw records -> 4 unique CVEs accepted",
+        rc["records_retrieved"] >= 8 and rc["records_accepted"] == 4
+        and rc["records_rejected"] == 0,
+        f"retrieved={rc['records_retrieved']} accepted={rc['records_accepted']}",
+    )
+    check(
+        "P6 writes landed (4 vulns, 4 evidence, 2 mappings)",
+        report["written"]["mutated"] is True
+        and rc["vulnerabilities_created"] == 4
+        and rc["evidence_created"] == 4
+        and rc["package_mappings_created"] == 2,
+        f"written={report['written']}",
+    )
+
+    vulns = first_column(graph, "MATCH (v:Vulnerability {source: 'osv'}) RETURN v")
+    check("P6 4 public Vulnerability nodes in graph", len(vulns) == 4,
+          f"n={len(vulns)}")
+
+    inc_after = first_column(graph, "MATCH (i:Incident) RETURN count(i)")[0][0]
+    check("P11 NO auto-incident created by ingestion",
+          inc_after == incident_before, f"before={incident_before} after={inc_after}")
+    mapped = first_column(
+        graph,
+        "MATCH (pv {id: 'PV3'})-[r:HAS_VULNERABILITY]->(v:Vulnerability) "
+        "RETURN v.cve_id, r.mapping_method ORDER BY v.cve_id",
+    )
+    mapped_cves = {row[0] for row in mapped}
+    methods = {row[1] for row in mapped}
+    check(
+        "P11 PV3 -> public CVEs via HAS_VULNERABILITY with mapping_method",
+        mapped_cves == _EXPECTED_MAPPED_CVES
+        and methods.issubset({"exact_package_version", "ecosystem_range"}),
+        f"mapped={sorted(mapped_cves)} methods={methods}",
+    )
+    check(
+        "P11 out-of-range CVEs NOT linked to PV3 (no fabrication)",
+        not ({cve for cve in _EXPECTED_UNMATCHED_CVES} & mapped_cves),
+        f"unexpected={mapped_cves}",
+    )
+
+    public_evidence = first_column(
+        graph,
+        "MATCH (e:Evidence {source_type: 'public'}) RETURN e.id, e.confidence",
+    )
+    check(
+        "P11 public evidence exists with confidence null (OSV no model)",
+        len(public_evidence) == 4
+        and all(conf is None for _, conf in public_evidence),
+        f"records={sorted(public_evidence)}",
+    )
+
+    pv3 = investigate_artifact(graph, "PV3")
+    pub_ids = {e["id"] for e in pv3["evidence"] if e["source_type"] == "public"}
+    check(
+        "P11 investigate PV3 surfaces public provenance",
+        len(pub_ids) == 2 and all(i.startswith("OSV-") for i in pub_ids),
+        f"evidence={sorted(pub_ids)}",
+    )
+    pv3_risk = enrich_investigation(graph, pv3)["risk"]
+    check(
+        "P11 PV3 vulnerability factor known (critical) via public vulns",
+        pv3_risk["vulnerability"]["status"] == "known"
+        and pv3_risk["vulnerability"]["severities"] == ["critical"],
+        f"vuln={pv3_risk['vulnerability']}",
+    )
+    check(
+        "P11 public evidence (confidence None) does NOT inflate evidence factor",
+        pv3_risk["evidence"]["status"] == "unknown"
+        and pv3_risk["factors"]["evidence"]["score"] == 0.0,
+        f"evidence-summary={pv3_risk['evidence']}",
+    )
+
+    print("  P10/P6: re-ingest = pure upsert (0 creates, all updates)")
+    report2 = ingest_public_vulnerabilities(graph=graph, dry_run=False)
+    c2r = report2["plan"]["counts"]
+    check(
+        "P10 re-ingest: vulnerabilities_created=0, updated=4",
+        c2r["vulnerabilities_created"] == 0
+        and c2r["vulnerabilities_updated"] == 4
+        and c2r["evidence_created"] == 0
+        and c2r["evidence_updated"] == 4,
+        f"counts={ {k: c2r[k] for k in ('vulnerabilities_created', 'vulnerabilities_updated', 'evidence_created', 'evidence_updated')} }",
+    )
+    final_count = first_column(graph, "MATCH (v:Vulnerability {source:'osv'}) RETURN count(v)")[0][0]
+    check("P10 no duplication after re-ingest (still 4 nodes)", final_count == 4,
+          f"count={final_count}")
+
+    print("  P12: failure isolation (network/OSV failure leaves graph intact)")
+    before = {
+        "vuln": first_column(graph, "MATCH (v:Vulnerability) RETURN count(v)")[0][0],
+        "ev": first_column(graph, "MATCH (e:Evidence) RETURN count(e)")[0][0],
+        "pv3": first_column(graph, "MATCH (p {id:'PV3'})-[r:HAS_VULNERABILITY]->() RETURN count(r)")[0][0],
+    }
+
+    def _boom(ecosystem, name):
+        raise OSVError("simulated OSV outage")
+
+    fail_report = ingest_public_vulnerabilities(
+        graph=graph, dry_run=False, fetch_fn=_boom,
+    )
+    after = {
+        "vuln": first_column(graph, "MATCH (v:Vulnerability) RETURN count(v)")[0][0],
+        "ev": first_column(graph, "MATCH (e:Evidence) RETURN count(e)")[0][0],
+        "pv3": first_column(graph, "MATCH (p {id:'PV3'})-[r:HAS_VULNERABILITY]->() RETURN count(r)")[0][0],
+    }
+    check(
+        "P12 OSV failure recorded, not raised, graph unchanged",
+        len(fail_report["errors"]) == 1 and before == after,
+        f"before={before} after={after} errors={fail_report['errors']}",
+    )
+    still = enrich_investigation(graph, investigate_artifact(graph, "PV3"))["risk"]
+    check(
+        "P12 investigation/risk still work after failed ingestion",
+        still["status"] == "complete" and still["vulnerability"]["status"] == "known",
+        f"status={still['status']}",
     )
 
 

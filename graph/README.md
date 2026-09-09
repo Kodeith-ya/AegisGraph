@@ -86,11 +86,17 @@ mistaken for evidence.
 
 ## Files
 - `schema.cypher` — indexes (model decisions/comments)
-- `seed.cypher` — deterministic synthetic seed data (idempotent via `MERGE`)
+- `seed.cypher` — deterministic synthetic seed data (idempotent via `MERGE`); incl.
+  isolated `P3/PV3` (`pyyaml 5.3`, ecosystem `PyPI`) fixture for Phase 6
 - `seed.py` — applies schema + seed to FalkorDB
-- `verify.py` — runs traversal / negative / incident checks + Phase 3, 4 (R1–R12) & 5 (E1–E12) tests
+- `verify.py` — traversal / negative / incident checks + Phase 3, 4 (R1–R12), 5 (E1–E12)
+  & 6 (P1–P14) tests; Phase 6 unit checks run with NO database (DB-degraded mode)
 - `queries.py` — Phase 3 blast-radius investigation + Phase 5 evidence queries (see below)
 - `risk.py` — Phase 4 deterministic risk engine (see below) + Phase 5 evidence factor
+- `osv.py` — Phase 6 public security-intelligence ingestion (OSV client, normalizer,
+  PEP 440 version matcher, deterministic upsert plan, CLI) — see root README
+- `graphrag_schema.py` — Phase 6 GraphRAG SDK integration point (ontology spec +
+  import-safe `build_graphrag_schema()`, prepared but NOT executed)
 
 ## Phase 3 investigation engine
 `queries.py` runs the graph-native blast-radius investigation:
@@ -164,20 +170,45 @@ R9 depth sensitivity (cap respected, superset) · R10 incident factor ·
 R11 missing vs known vulnerability severity · R12 DB failure raises (→503 at API).
 
 Phase 5 (E1–E12): E1 evidence nodes exist · E2 SUPPORTED_BY rels · E3 DESCRIBES rels ·
-E4 confidence range · E5 valid source types · E6 reseed idempotency · E7 investigation
-returns evidence (D1/V1/PV1) · E8 no fabricated evidence (APP_UNRELATED) ·
-E9 evidence confidence → deterministic risk factor · E10 missing evidence = unknown ·
-E11 repeat determinism incl. evidence · E12 malformed confidence / unknown source type
-rejected and excluded from aggregation.
+E4 confidence null (explicit unknown) or in [0,1] · E5 valid source types ·
+E6 reseed idempotency · E7 investigation returns evidence (D1/V1/PV1) ·
+E8 no fabricated evidence (APP_UNRELATED) · E9 evidence confidence → deterministic risk
+factor · E10 missing evidence = unknown · E11 repeat determinism incl. evidence ·
+E12 malformed confidence / unknown source type rejected and excluded from aggregation.
+
+## Phase 6 public security intelligence ingestion
+`osv.py` retrieves a small deterministic public subset (PyPI `pyyaml`) from the real
+OSV API, validates + normalizes the records, collapses GHSA/PYSEC CVE duplicates
+(preferring the severity-bearing record), maps `PackageVersion` nodes ONLY via exact
+OSV affected-version lists or PEP 440 ECOSYSTEM ranges (never fuzzy, never fabricated),
+and MERGE-upserts public `:Vulnerability` + `:Evidence` nodes (id `OSV-<id>`,
+`source_type: "public"`, `confidence: None` — OSV has no per-record confidence model)
+plus `DESCRIBES`/`HAS_VULNERABILITY` edges. No incidents are ever auto-created, and an
+OSV failure is recorded without touching the graph. See the root README for the full
+Phase 6 trust model, live `pyyaml 5.3` expectations, and the GraphRAG SDK note.
+
+Phase 6 coverage (P1–P14): P1 OSV fetch contract · P2 record validation · P3 normalization
++ severity aliasing · P4 CVE dedupe · P5 version-mapping matrix (exact/range/PEP 440) ·
+P6 live OSV ingestion · P7 plan integrity (provenance, no auto-incident, honest None) ·
+P8 plan idempotency (0 creates on re-run) · P9 dry-run no-op · P10 upsert detection ·
+P11 post-ingestion provenance + honest risk · P12 failure isolation · P13 orchestration +
+failure reporting · P14 determinism. P1–P5/P7–P9/P13/P14 run with **no database**;
+P6/P10–P12 need live FalkorDB + OSV network.
 
 ## Commands (from repo root, with FalkorDB running)
 ```
 # start FalkorDB
 docker compose up -d
 
-# seed (idempotent)
+# seed (idempotent; includes isolated P3/PV3 pyyaml fixture)
 python -m graph.seed
 
 # verify the graph + investigation + risk queries
 python -m graph.verify
+
+# Phase 6: plan public OSV ingestion WITHOUT touching the database
+python -m graph.osv --dry-run
+
+# Phase 6: full public ingestion (needs live FalkorDB)
+python -m graph.osv
 ```
