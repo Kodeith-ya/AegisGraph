@@ -5,6 +5,7 @@ Phase 2 establishes a small, deterministic, synthetic dependency/provenance grap
 FalkorDB that can answer the core investigation question:
 
 > If artifact X becomes unsafe, which downstream systems are affected and through which paths?
+> And — with Phase 7 — *what happens if we remove / upgrade / isolate the unsafe artifact?*
 
 ## Node types (Phase 2 + Phase 5)
 | Label | Role | Example |
@@ -95,6 +96,8 @@ mistaken for evidence.
 - `risk.py` — Phase 4 deterministic risk engine (see below) + Phase 5 evidence factor
 - `osv.py` — Phase 6 public security-intelligence ingestion (OSV client, normalizer,
   PEP 440 version matcher, deterministic upsert plan, CLI) — see root README
+- `counterfactual.py` — Phase 7 counterfactual remediation engine (`analyze_counterfactual`,
+  non-mutating remove/upgrade/isolate) — see root README
 - `graphrag_schema.py` — Phase 6 GraphRAG SDK integration point (ontology spec +
   import-safe `build_graphrag_schema()`, prepared but NOT executed)
 
@@ -194,6 +197,43 @@ P8 plan idempotency (0 creates on re-run) · P9 dry-run no-op · P10 upsert dete
 P11 post-ingestion provenance + honest risk · P12 failure isolation · P13 orchestration +
 failure reporting · P14 determinism. P1–P5/P7–P9/P13/P14 run with **no database**;
 P6/P10–P12 need live FalkorDB + OSV network.
+
+## Phase 7 counterfactual remediation intelligence
+`counterfactual.py` answers "what if we remediate artifact X?" without ever mutating the
+graph. FalkorDB still performs all reachability / path / production reasoning: the Phase 3
+traversals accept an optional `blocked` id-set and append a query-time path exclusion
+(`WHERE all(n IN nodes(p) WHERE NOT n.id IN $blocked)`) — no `DELETE`, no temporary
+properties, no rollback.
+
+- **Actions (closed set, deterministic):**
+  - `remove` — recall an artifact (`blocked = [target]`). Removing the artifact itself
+    also zeroes its incidents/evidence in the hypothetical (they are *about* the removed
+    artifact; the graph is untouched).
+  - `isolate` — cut an `Application`/`Deployment` out of the topology.
+  - `upgrade` — recompute `PackageVersion` vulnerability exposure for a `target_version`
+    using the OSV affected ranges persisted by Phase 6 on each `:Vulnerability`
+    (`v.affected` JSON) and the exact Phase 6 PEP 440 rules
+    (`osv.package_version_in_affected`). Offline — no OSV call at analysis time.
+- **Security states:** `known_affected` / `known_unaffected` / `unknown`. No OSV data or
+  no package identity ⇒ `unknown` (NEVER reported as safe). `known_affected` keeps its
+  matched severities, so a still-vulnerable upgrade shows no false risk reduction.
+- **Assessment (no LLM):** `effective` (blast radius eliminated) / `partially_effective`
+  (≥1 deterministic reduction) / `no_material_change` / `unknown`.
+- **Delta conventions:** `*_delta = counterfactual − baseline` (negative = improvement),
+  `*_reduction = baseline − counterfactual` (positive = improvement), for blast radius,
+  production impact, propagation depth, incidents, vulnerability exposure, and risk score;
+  plus `risk_level_before` / `risk_level_after` and eliminated/remaining application paths.
+- Phase 6 ingestion persists each OSV record's normalized `affected` entries on the
+  `:Vulnerability` node (new `v.affected` JSON property) — this is what makes offline,
+  deterministic UPGRADE evaluation possible. `apply_plan` remains MERGE/upsert idempotent.
+
+Phase 7 coverage (C1–C15): C1 REMOVE reachability · C2 UPGRADE known_unaffected ·
+C3 still-vulnerable upgrade (severity kept, no_material_change) · C4 unknown version never
+"safe" · C5 production-impact delta · C6 eliminated paths · C7 remaining paths ·
+C8 risk-delta parity with the Phase 4 engine · C9 byte-identical determinism ·
+C10 **no-mutation guarantee** · C11 invalid action →400 (pre-DB) · C12 invalid
+target_version →400 (pre-DB) · C13 unknown artifact →404 · C14 DB failure propagates (→503)
+· C15 Phase 1–6 regression (blocked=empty behaves exactly like Phase 3).
 
 ## Commands (from repo root, with FalkorDB running)
 ```

@@ -13,11 +13,21 @@ Executes real Cypher queries and prints PASS/FAIL for:
       aliasing, CVE dedupe, version mapping matrix, plan integrity,
       plan idempotency, dry-run no-op, orchestration + failure
       isolation, determinism).
-  30: Phase 6 P6, P10-P12 — INTEGRATION checks that need a LIVE
-      FalkorDB (+ live OSV network for P6): real pyyaml ingestion,
-      upsert detection, post-ingestion graph facts (public provenance,
-      honest risk: public evidence w/o confidence never inflates risk,
-      no auto-incident), and failure isolation.
+30: Phase 6 P6, P10-P12 — INTEGRATION checks that need a LIVE
+       FalkorDB (+ live OSV network for P6): real pyyaml ingestion,
+       upsert detection, post-ingestion graph facts (public provenance,
+       honest risk: public evidence w/o confidence never inflates risk,
+       no auto-incident), and failure isolation.
+   31: Phase 7 C11, C12, C14 — UNIT checks that never need FalkorDB:
+       invalid action -> 400, invalid/absent target_version -> 400, and
+       DB failure -> propagated (API maps to 503).
+   32: Phase 7 C1-C10, C13, C15 — INTEGRATION checks that need a LIVE
+       FalkorDB: non-mutating REMOVE/UPGRADE/ISOLATE simulations,
+       security states known_affected/known_unaffected/unknown,
+       production-impact delta, eliminated/remaining paths, risk delta
+       parity with the Phase 4 engine, determinism, no-mutation
+       guarantee, unknown-artifact 404, and regression (Phase 1-6
+       behavior unchanged).
 
 If FalkorDB is unreachable, the Phase 6 UNIT section and GraphRAG-SDK
 availability check still run; DB-dependent sections are skipped with a
@@ -38,6 +48,7 @@ sys.path.insert(0, str(ROOT / "apps" / "api"))
 from .seed import main as seed_main  # noqa: E402
 
 from .queries import (  # noqa: E402
+    applications_paths,
     evidence_for,
     investigate_artifact,
     resolve_artifact,
@@ -58,6 +69,15 @@ from .graphrag_schema import (  # noqa: E402
     ONTOLOGY_ENTITIES,
     ONTOLOGY_RELATIONS,
     build_graphrag_schema,
+)
+
+from .counterfactual import (  # noqa: E402
+    InvalidCounterfactual,
+    KNOWN_AFFECTED,
+    KNOWN_UNAFFECTED,
+    UNKNOWN,
+    NO_MATERIAL_CHANGE,
+    analyze_counterfactual,
 )
 
 from .osv import (  # noqa: E402
@@ -213,6 +233,7 @@ def main():
         print("[DB-DEGRADED] Running Phase 6 unit checks only; P6/P10-P12 "
               "(live FalkorDB) skipped.\n")
         verify_phase6_unit()
+        verify_phase7_unit()
         return
 
     print("\n--- 1. Required nodes exist ---")
@@ -688,6 +709,8 @@ def main():
 
     verify_phase6_unit()
     verify_phase6_integration(graph)
+    verify_phase7_unit()
+    verify_phase7_integration(graph)
 
 
 class _FakeUrlopen:
@@ -1178,6 +1201,262 @@ def verify_phase6_integration(graph):
         "P12 investigation/risk still work after failed ingestion",
         still["status"] == "complete" and still["vulnerability"]["status"] == "known",
         f"status={still['status']}",
+    )
+
+
+def verify_phase7_unit():
+    """Phase 7 (C11, C12, C14): pure validation — no FalkorDB required.
+
+    Invalid action / invalid target_version are rejected BEFORE any DB
+    query is issued (proven with _ExplodingGraph); a DB failure during a
+    valid simulation propagates as an exception (API maps to 503).
+    """
+    print("\n--- 31. Phase 7 (unit: C11, C12, C14) ---")
+
+    # ---------------------------- C11: invalid action -> 400 -----------------------
+    try:
+        analyze_counterfactual(_ExplodingGraph(), "D1", "patch-all")
+        raised = False
+    except InvalidCounterfactual:
+        raised = True
+    check(
+        "C11 unsupported action rejected BEFORE any DB query (-> 400)",
+        raised,
+        "action validation must precede all traversal",
+    )
+
+    # ---------------------------- C12: invalid/absent target_version -> 400 --------
+    for label, kwargs in (
+        ("absent target_version", {"action": "upgrade", "target_version": ""}),
+        ("blank target_version", {"action": "upgrade", "target_version": "   "}),
+        ("non-PEP440 version", {"action": "upgrade", "target_version": "newest"}),
+    ):
+        try:
+            analyze_counterfactual(_ExplodingGraph(), "PV3", **kwargs)
+            ok = False
+        except InvalidCounterfactual:
+            ok = True
+        check(f"C12 {label} rejected before DB access (-> 400)", ok)
+
+    # ---------------------------- C14: DB failure -> propagates (-> 503) -----------
+    try:
+        analyze_counterfactual(_BrokenGraph(), "D1", "remove")
+        raised = False
+    except Exception:  # noqa: BLE001 — any transport failure must propagate
+        raised = True
+    check(
+        "C14 DB failure propagates (endpoint maps to 503, never a fake answer)",
+        raised,
+        "analyze_counterfactual must not swallow transport failures",
+    )
+
+
+def verify_phase7_integration(graph):
+    """Phase 7 (C1-C10, C13, C15): needs LIVE FalkorDB (post-Phase 6).
+
+    Requires the OSV ingestion from section 30 (PV3 mapped to pyyaml OSV
+    vulns whose `affected` ranges are persisted) so UPGRADE can evaluate
+    target versions offline and deterministically.
+    """
+    print("\n--- 32. Phase 7 (integration: C1-C10, C13, C15; live FalkorDB) ---")
+
+    def _state():
+        return {
+            "nodes": first_column(graph, "MATCH (n) RETURN count(n)")[0][0],
+            "rels": first_column(graph, "MATCH ()-[r]->() RETURN count(r)")[0][0],
+            "vulns": first_column(graph, "MATCH (v:Vulnerability {source:'osv'}) RETURN count(v)")[0][0],
+            "evidence": first_column(graph, "MATCH (e:Evidence {source_type:'public'}) RETURN count(e)")[0][0],
+            "incidents": first_column(graph, "MATCH (i:Incident) RETURN count(i)")[0][0],
+            "mappings": first_column(graph, "MATCH ()-[r:HAS_VULNERABILITY]->() RETURN count(r)")[0][0],
+        }
+
+    before = _state()
+
+    base_d1 = analyze_counterfactual(graph, "D1", "remove", target_id="D1")
+    check(
+        "C1 baseline blast radius intact (D1 = 9 affected)",
+        base_d1["baseline"]["blast_radius"]["total_affected"] == 9
+        and base_d1["baseline"]["risk"]["score"] == 74,
+        f"total={base_d1['baseline']['blast_radius']['total_affected']} "
+        f"risk={base_d1['baseline']['risk']['score']}",
+    )
+
+    # ---------------------------- C1: REMOVE changes reachability -----------------
+    rm_mv1 = analyze_counterfactual(graph, "D1", "remove", target_id="MV1")
+    remaining = {n["id"] for n in rm_mv1["counterfactual"]["affected_nodes"]}
+    check(
+        "C1 REMOVE MV1 prunes its downstream apps/nodes (9 -> 4)",
+        rm_mv1["counterfactual"]["blast_radius"]["total_affected"] == 4
+        and remaining == {"MV2", "APP2", "APP4", "DEP2"},
+        f"remaining={sorted(remaining)}",
+    )
+    rm_root = analyze_counterfactual(graph, "D1", "remove")
+    check(
+        "C1 REMOVE artifact root clears the whole blast radius (9 -> 0)",
+        rm_root["counterfactual"]["blast_radius"]["total_affected"] == 0
+        and rm_root["counterfactual"]["maximum_depth"] == 0,
+        f"cf={rm_root['counterfactual']['blast_radius']['total_affected']}",
+    )
+
+    # ---------------------------- C2: UPGRADE known_unaffected --------------------
+    up_safe = analyze_counterfactual(graph, "PV3", "upgrade", target_version="6.0")
+    check(
+        "C2 UPGRADE to fully-remediated version -> known_unaffected",
+        up_safe["counterfactual"]["security_state"] == KNOWN_UNAFFECTED
+        and up_safe["counterfactual"]["vulnerability"] == {"status": "known", "severities": []}
+        and up_safe["baseline"]["vulnerability"]["severities"] == ["critical"],
+        f"state={up_safe['counterfactual']['security_state']} "
+        f"sev={up_safe['counterfactual']['vulnerability']['severities']}",
+    )
+    check(
+        "C2 known_unaffected removes vulnerability exposure (factor 100 -> 0)",
+        up_safe["delta"]["vulnerability_reduction"] == 100.0
+        and up_safe["delta"]["vulnerability_delta"] == -100.0,
+        f"red={up_safe['delta']['vulnerability_reduction']}",
+    )
+
+    # ---------------------------- C3: still-vulnerable upgrade --------------------
+    up_still = analyze_counterfactual(graph, "PV3", "upgrade", target_version="5.1.2")
+    check(
+        "C3 UPGRADE to a still-affected version -> known_affected, severity kept",
+        up_still["counterfactual"]["security_state"] == KNOWN_AFFECTED
+        and up_still["counterfactual"]["vulnerability"]["severities"] == ["critical"]
+        and up_still["assessment"]["status"] == NO_MATERIAL_CHANGE,
+        f"state={up_still['counterfactual']['security_state']} "
+        f"sev={up_still['counterfactual']['vulnerability']['severities']} "
+        f"status={up_still['assessment']['status']}",
+    )
+    check(
+        "C3 known_affected exposes matched vulnerability instances",
+        len(up_still["counterfactual"]["matched_vulnerabilities"]) >= 1
+        and all(
+            m["mapping_method"] in ("exact_package_version", "ecosystem_range")
+            for m in up_still["counterfactual"]["matched_vulnerabilities"]
+        ),
+        f"matched={up_still['counterfactual']['matched_vulnerabilities']}",
+    )
+
+    # ---------------------------- C4: unknown version -----------------------------
+    up_unknown = analyze_counterfactual(graph, "PV1", "upgrade", target_version="2.0")
+    check(
+        "C4 no OSV data -> security state unknown (never reported 'safe')",
+        up_unknown["counterfactual"]["security_state"] == UNKNOWN
+        and up_unknown["assessment"]["status"] == "unknown",
+        f"state={up_unknown['counterfactual']['security_state']} "
+        f"assessment={up_unknown['assessment']['status']}",
+    )
+
+    # ---------------------------- C5: production-impact delta ---------------------
+    iso_app1 = analyze_counterfactual(graph, "D1", "isolate", application_id="APP1")
+    check(
+        "C5 ISOLATE production app drops production impact by 1",
+        len(iso_app1["baseline"]["production_applications"]) == 2
+        and len(iso_app1["counterfactual"]["production_applications"]) == 1
+        and iso_app1["delta"]["production_impact_reduction"] == 1
+        and iso_app1["delta"]["production_impact_delta"] == -1,
+        f"prod={len(iso_app1['baseline']['production_applications'])} -> "
+        f"{len(iso_app1['counterfactual']['production_applications'])}",
+    )
+
+    # ---------------------------- C6/C7: eliminated & remaining paths --------------
+    elim = {p["application"]["id"] for p in rm_mv1["paths"]["eliminated"]}
+    remain = {p["application"]["id"] for p in rm_mv1["paths"]["remaining"]}
+    check(
+        "C6 eliminated paths = apps no longer reachable after REMOVE",
+        elim == {"APP1", "APP5"} and remain == {"APP2", "APP4"},
+        f"eliminated={sorted(elim)} remaining={sorted(remain)}",
+    )
+    check(
+        "C7 eliminated path START/END come from the actual graph route",
+        all(
+            p["path"]["nodes"][0]["id"] == "D1"
+            and p["path"]["nodes"][-1]["id"] == p["application"]["id"]
+            for p in rm_mv1["paths"]["eliminated"]
+        ),
+    )
+    check(
+        "C6/C7 UPGRADE is topology-neutral (no eliminated paths)",
+        len(up_safe["paths"]["eliminated"]) == 0
+        and {p["application"]["id"] for p in up_safe["paths"]["remaining"]} == {"APP3"},
+    )
+
+    # ---------------------------- C8: risk delta parity with Phase 4 --------------
+    engine_risk = enrich_investigation(
+        graph, investigate_artifact(graph, "D1")
+    )["risk"]
+    check(
+        "C8 counterfactual baseline risk == Phase 4 deterministic engine risk",
+        base_d1["baseline"]["risk"] == engine_risk,
+        f"risk={base_d1['baseline']['risk']['score']}",
+    )
+    check(
+        "C8 risk_score_delta == cf_risk - baseline_risk (sign convention)",
+        rm_mv1["delta"]["risk_score_delta"]
+        == rm_mv1["counterfactual"]["risk"]["score"]
+        - rm_mv1["baseline"]["risk"]["score"]
+        and rm_mv1["delta"]["risk_reduction"]
+        == rm_mv1["baseline"]["risk"]["score"]
+        - rm_mv1["counterfactual"]["risk"]["score"],
+        f"delta={rm_mv1['delta']['risk_score_delta']}",
+    )
+    check(
+        "C8 risk_level_before/after present and valid",
+        rm_mv1["delta"]["risk_level_before"] in {lvl for _, lvl in RISK_LEVELS}
+        and rm_mv1["delta"]["risk_level_after"] in {lvl for _, lvl in RISK_LEVELS},
+        f"before={rm_mv1['delta']['risk_level_before']} "
+        f"after={rm_mv1['delta']['risk_level_after']}",
+    )
+
+    # ---------------------------- C9: determinism --------------------------------
+    run_a = analyze_counterfactual(graph, "D1", "isolate", application_id="DEP1")
+    run_b = analyze_counterfactual(graph, "D1", "isolate", application_id="DEP1")
+    check(
+        "C9 identical input -> byte-for-byte identical counterfactual result",
+        run_a == run_b,
+        "two independent runs must produce identical dicts",
+    )
+    check(
+        "C9 affected nodes deterministically sorted ((hops, id) ascending)",
+        [n["id"] for n in run_a["counterfactual"]["affected_nodes"]]
+        == ["MV1", "MV2", "A1", "APP1", "APP2", "APP4", "APP5", "DEP2"],
+        f"order={[n['id'] for n in run_a['counterfactual']['affected_nodes']]}",
+    )
+
+    # ---------------------------- C10: no mutation --------------------------------
+    after = _state()
+    check(
+        "C10 simulations never mutate the graph (nodes/rels/vulns/evidence/incidents)",
+        before == after,
+        f"before={before} after={after}",
+    )
+
+    # ---------------------------- C13: unknown artifact -> 404 ---------------------
+    try:
+        analyze_counterfactual(graph, "DOES_NOT_EXIST", "remove")
+        raised = False
+    except LookupError:
+        raised = True
+    check("C13 unknown artifact -> LookupError (API maps to 404)", raised)
+
+    # ---------------------------- C15: regression ---------------------------------
+    d1_after = investigate_artifact(graph, "D1")
+    check(
+        "C15 D1 blast radius unchanged after all simulations (still 9)",
+        d1_after["blast_radius"]["total_affected"] == 9
+        and {n["id"] for n in d1_after["dependencies"]}
+        == {"MV1", "MV2", "A1", "APP1", "APP2", "APP4", "APP5", "DEP1", "DEP2"},
+    )
+    pv3_after = investigate_artifact(graph, "PV3")
+    check(
+        "C15 PV3 unchanged (edge MV3->PV3 gives blast radius {MV3,A2,APP3,DEP3})",
+        {n["id"] for n in pv3_after["dependencies"]}
+        == {"MV3", "A2", "APP3", "DEP3"},
+        f"pv3={sorted(n['id'] for n in pv3_after['dependencies'])}",
+    )
+    plain = applications_paths(graph, "D1")
+    check(
+        "C15 blocked=empty callers behave exactly like Phase 3 (identical paths)",
+        plain == applications_paths(graph, "D1", blocked=[]),
     )
 
 

@@ -27,6 +27,18 @@ i.e. a node that points toward `start`. The relationship set below
 covers every dependency edge in the Phase 2 schema, so traversing them
 inbound from the investigated artifact yields its blast radius.
 
+Counterfactual exclusions (Phase 7)
+-----------------------------------
+Traversal functions accept an optional `blocked` iterable of artifact
+ids. When non-empty, the query appends a path filter:
+
+    WHERE all(n IN nodes(p) WHERE NOT n.id IN $blocked)
+
+so paths passing through a blocked node disappear. This is PURELY a
+query-time exclusion — the graph is never mutated (no DELETE / DETACH /
+temporary properties). It is how Phase 7 simulates REMOVE/ISOLATE
+remediations while FalkorDB still performs all reachability reasoning.
+
 Traversal safety
 ----------------
 Downstream traversals are bounded by max_depth (default DEFAULT_MAX_DEPTH).
@@ -34,6 +46,18 @@ max_depth is a server-controlled positive integer that is interpolated
 directly into the relationship quantifier (validated by _clamp_depth);
 the artifact `id` is ALWAYS passed as a bind parameter ($id).
 """
+
+# Optional WHERE predicate used by Phase 7 to exclude nodes (by id) from
+# a matched path without mutating the graph. Empty by default so every
+# existing Phase 1-6 caller is byte-for-byte unaffected.
+def _blocked_clause(blocked) -> str:
+    if not blocked:
+        return ""
+    return "WHERE all(n IN nodes(p) WHERE NOT n.id IN $blocked)\n"
+
+def _blocked_params(blocked) -> dict:
+    """Bind-parameter dict for the blocked clause (list of ids)."""
+    return {"blocked": list(blocked)} if blocked else {}
 DEFAULT_MAX_DEPTH = 8
 MAX_DEPTH_LIMIT = 20
 PRODUCTION_ENVIRONMENT = "production"
@@ -169,20 +193,23 @@ def resolve_artifact(graph, artifact_id: str):
     return None
 
 
-def downstream_nodes(graph, artifact_id: str, max_depth=None):
+def downstream_nodes(graph, artifact_id: str, max_depth=None, blocked=None):
     """Every distinct downstream dependent of the artifact (with min hops).
 
     FalkorDB computes reachability + aggregation; the endpoint never
-    invents members of the blast radius.
+    invents members of the blast radius. `blocked` excludes paths that
+    pass through the given artifact ids (Phase 7, non-mutating).
     """
     max_depth = _clamp_depth(max_depth)
     pattern = _rel_pattern(max_depth)
+    params = {"id": artifact_id, **_blocked_params(blocked)}
     res = graph.query(
         f"MATCH (start {{id: $id}})\n"
         f"MATCH p=(start){pattern}(dest)\n"
+        f"{_blocked_clause(blocked)}"
         f"RETURN dest, min(length(p)) AS hops\n"
         f"ORDER BY hops ASC",
-        {"id": artifact_id},
+        params,
     )
     affected = []
     if res and res.result_set:
@@ -195,22 +222,25 @@ def downstream_nodes(graph, artifact_id: str, max_depth=None):
     return affected
 
 
-def applications_paths(graph, artifact_id: str, max_depth=None):
+def applications_paths(graph, artifact_id: str, max_depth=None, blocked=None):
     """Shortest downstream path from artifact to each affected Application.
 
     Returns {app_id: {"app": {...}, "path": {"nodes":[...], "edges":[...]}}}.
     All matching Application endpoints are requested in one query and the
     shortest path per application is chosen (FalkorDB returns the full path,
-    which we consume rather than rebuild).
+    which we consume rather than rebuild). `blocked` excludes paths that
+    pass through the given artifact ids (Phase 7, non-mutating).
     """
     max_depth = _clamp_depth(max_depth)
     pattern = _rel_pattern(max_depth)
+    params = {"id": artifact_id, **_blocked_params(blocked)}
     res = graph.query(
         f"MATCH (start {{id: $id}})\n"
         f"MATCH p=(start){pattern}(app:Application)\n"
+        f"{_blocked_clause(blocked)}"
         f"RETURN app, p, length(p) AS hops\n"
         f"ORDER BY hops ASC",
-        {"id": artifact_id},
+        params,
     )
     best = {}
     if res and res.result_set:
@@ -230,7 +260,7 @@ def applications_paths(graph, artifact_id: str, max_depth=None):
     return best
 
 
-def production_applications(graph, artifact_id: str, max_depth=None):
+def production_applications(graph, artifact_id: str, max_depth=None, blocked=None):
     """Downstream Applications that have a production Deployment.
 
     Production is a *graph* fact: an Application counts only when a
@@ -238,18 +268,22 @@ def production_applications(graph, artifact_id: str, max_depth=None):
     exists. We deliberately do NOT trust application names, and we require
     the Deployment relationship rather than just the Application's
     `environment` property, so an app marked "production" but with no
-    actual production deployment edge is not over-counted.
+    actual production deployment edge is not over-counted. `blocked`
+    excludes paths that pass through the given ids (Phase 7, non-mutating).
     """
     max_depth = _clamp_depth(max_depth)
     pattern = _rel_pattern(max_depth)
+    params = {"id": artifact_id, "env": PRODUCTION_ENVIRONMENT,
+              **_blocked_params(blocked)}
     res = graph.query(
         f"MATCH (start {{id: $id}})\n"
         f"MATCH p=(start){pattern}(app:Application)\n"
+        f"{_blocked_clause(blocked)}"
         f"MATCH (dep:Deployment {{environment: $env}})-[:DEPLOYS]->(app)\n"
         f"WITH app, dep, min(length(p)) AS hops\n"
         f"RETURN app, dep, hops\n"
         f"ORDER BY hops ASC",
-        {"id": artifact_id, "env": PRODUCTION_ENVIRONMENT},
+        params,
     )
     result = []
     if res and res.result_set:
@@ -264,21 +298,22 @@ def production_applications(graph, artifact_id: str, max_depth=None):
     return result
 
 
-def maximum_depth(graph, artifact_id: str, max_depth=None) -> int:
+def maximum_depth(graph, artifact_id: str, max_depth=None, blocked=None) -> int:
     """Maximum propagation depth across all affected downstream nodes.
 
     Computed from the graph-returned hops (min length per distinct node),
-    not re-derived by the endpoint.
+    not re-derived by the endpoint. `blocked` excludes paths that pass
+    through the given artifact ids (Phase 7, non-mutating).
     """
-    nodes = downstream_nodes(graph, artifact_id, max_depth=max_depth)
+    nodes = downstream_nodes(graph, artifact_id, max_depth=max_depth, blocked=blocked)
     if not nodes:
         return 0
     return max(n["hops"] for n in nodes)
 
 
-def downstream_dependents(graph, artifact_id: str, max_depth=None):
+def downstream_dependents(graph, artifact_id: str, max_depth=None, blocked=None):
     """Downstream dependent population: distinct affected IDs by type."""
-    nodes = downstream_nodes(graph, artifact_id, max_depth=max_depth)
+    nodes = downstream_nodes(graph, artifact_id, max_depth=max_depth, blocked=blocked)
     by_type = {}
     for node in nodes:
         t = node.get("type") or "Unknown"
@@ -363,21 +398,23 @@ def evidence_for(graph, artifact_id: str):
     ]
 
 
-def investigate_artifact(graph, artifact_id: str, max_depth=None) -> dict:
+def investigate_artifact(graph, artifact_id: str, max_depth=None, blocked=None) -> dict:
     """Full investigation for a single artifact (pure graph reasoning).
 
-    Raises LookupError if the artifact does not exist in the graph.
+    `blocked` excludes paths that pass through the given artifact ids
+    (Phase 7, non-mutating query-time exclusion). Raises LookupError if
+    the artifact does not exist in the graph.
     """
     artifact = resolve_artifact(graph, artifact_id)
     if artifact is None:
         raise LookupError(f"artifact {artifact_id} not found")
 
     max_depth = _clamp_depth(max_depth)
-    apps = applications_paths(graph, artifact_id, max_depth=max_depth)
-    prod = production_applications(graph, artifact_id, max_depth=max_depth)
-    dependents = downstream_dependents(graph, artifact_id, max_depth=max_depth)
+    apps = applications_paths(graph, artifact_id, max_depth=max_depth, blocked=blocked)
+    prod = production_applications(graph, artifact_id, max_depth=max_depth, blocked=blocked)
+    dependents = downstream_dependents(graph, artifact_id, max_depth=max_depth, blocked=blocked)
     incidents = incidents_on(graph, artifact_id)
-    depth = maximum_depth(graph, artifact_id, max_depth=max_depth)
+    depth = maximum_depth(graph, artifact_id, max_depth=max_depth, blocked=blocked)
     evidence = evidence_for(graph, artifact_id)
 
     return {

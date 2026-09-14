@@ -2,6 +2,7 @@ import sys
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Response, Query
+from pydantic import BaseModel
 
 # Make `apps/api` importable (this module lives in apps/api and imports `db`
 # via a plain top-level import; uvicorn must be able to resolve it regardless
@@ -21,8 +22,23 @@ if str(ROOT) not in sys.path:
 
 from graph.queries import evidence_for, investigate_artifact, resolve_artifact  # noqa: E402
 from graph.risk import enrich_investigation  # noqa: E402
+from graph.counterfactual import InvalidCounterfactual, analyze_counterfactual  # noqa: E402
 
 app = FastAPI(title="AegisGraph API")
+
+
+class CounterfactualRequest(BaseModel):
+    """Body for POST /api/counterfactual/{artifact_id}.
+
+    `action` (required) is one of: remove | upgrade | isolate. `target_id`
+    defaults to `artifact_id`; `application_id` is accepted as a convenience
+    alias for the ISOLATE target.
+    """
+
+    action: str
+    target_version: str | None = None
+    target_id: str | None = None
+    application_id: str | None = None
 
 
 @app.get("/health")
@@ -106,4 +122,45 @@ def evidence(artifact_id: str):
         raise HTTPException(
             status_code=503,
             detail="FalkorDB unavailable or evidence retrieval failed",
+        )
+
+
+@app.post("/api/counterfactual/{artifact_id}")
+def counterfactual(
+    artifact_id: str,
+    request: CounterfactualRequest,
+    max_depth: int | None = Query(default=None, ge=1, le=20),
+):
+    """Graph-native counterfactual remediation intelligence (Phase 7).
+
+    Simulates `remove` / `upgrade` / `isolate` WITHOUT mutating the graph
+    (query-time path exclusions + offline OSV/PEP 440 re-evaluation) and
+    returns baseline / counterfactual / delta / paths / assessment.
+    Validation: unknown action or invalid target_version => 400; unknown
+    artifact or target => 404; DB failure => 503.
+    """
+    try:
+        graph = get_graph()
+        return analyze_counterfactual(
+            graph,
+            artifact_id,
+            action=request.action,
+            target_version=request.target_version,
+            target_id=request.target_id,
+            application_id=request.application_id,
+            max_depth=max_depth,
+        )
+    except InvalidCounterfactual as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except LookupError:
+        raise HTTPException(
+            status_code=404,
+            detail=f"artifact '{artifact_id}' or remediation target not found in the graph",
+        )
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(
+            status_code=503,
+            detail="FalkorDB unavailable or counterfactual analysis failed",
         )

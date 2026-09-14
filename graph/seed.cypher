@@ -191,6 +191,7 @@ MATCH (p1:Package {id: 'P1'}), (pv2:PackageVersion {id: 'PV2'}) MERGE (p1)-[:HAS
 MATCH (mv1:ModelVersion {id: 'MV1'}), (pv1:PackageVersion {id: 'PV1'}) MERGE (mv1)-[:DEPENDS_ON]->(pv1);
 MATCH (mv2:ModelVersion {id: 'MV2'}), (pv1:PackageVersion {id: 'PV1'}) MERGE (mv2)-[:DEPENDS_ON]->(pv1);
 MATCH (mv3:ModelVersion {id: 'MV3'}), (pv2:PackageVersion {id: 'PV2'}) MERGE (mv3)-[:DEPENDS_ON]->(pv2);
+MATCH (mv3:ModelVersion {id: 'MV3'}), (pv3:PackageVersion {id: 'PV3'}) MERGE (mv3)-[:DEPENDS_ON]->(pv3);
 
 MATCH (pv1:PackageVersion {id: 'PV1'}), (v1:Vulnerability {id: 'V1'}) MERGE (pv1)-[:HAS_VULNERABILITY]->(v1);
 

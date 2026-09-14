@@ -471,9 +471,15 @@ def build_risk(graph, investigation: dict, vulnerabilities: dict | None = None) 
     }
 
 
-def enrich_investigation(graph, investigation: dict) -> dict:
-    """Add `risk` and `prioritized_applications` to a Phase 3 investigation."""
-    vuln = _vulnerability_summary(graph, investigation)
+def enrich_investigation(graph, investigation: dict, vulnerabilities: dict | None = None) -> dict:
+    """Add `risk` and `prioritized_applications` to a Phase 3 investigation.
+
+    `vulnerabilities` optionally overrides the graph-derived vulnerability
+    summary (e.g. {status, severities}) so Phase 7 UPGRADE can compute risk
+    from a hypothetical target version without mutating the graph. When
+    None (the normal Phase 1-6 path), exposure is resolved from graph facts.
+    """
+    vuln = vulnerabilities or _vulnerability_summary(graph, investigation)
     risk = build_risk(graph, investigation, vulnerabilities=vuln)
     prioritized = prioritize_applications(
         investigation, {"status": vuln["status"], "severities": vuln["severities"]}

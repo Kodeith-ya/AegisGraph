@@ -398,6 +398,22 @@ def build_upsert_plan(vulns, known_versions=(), known_vuln_ids=(), known_evidenc
             "ingested_at": now_iso,
             "references": [{"type": t, "url": u} for t, u in normalized.references],
             "data_source": "public",
+            # Normalized ECOSYSTEM affected entries are persisted so Phase 7
+            # UPGRADE can re-evaluate `known_affected / known_unaffected /
+            # unknown` for an arbitrary target version OFFLINE (no OSV call),
+            # reusing the exact PEP 440 semantics in
+            # `package_version_in_affected`. Pure derivation — nothing new
+            # is invented; malformed entries were already rejected above.
+            "affected": [
+                {
+                    "ecosystem": a.ecosystem,
+                    "package_name": a.package_name,
+                    "versions": sorted(a.versions),
+                    "introduced": a.introduced,
+                    "fixed": a.fixed,
+                }
+                for a in normalized.affected
+            ],
         })
 
         ev_created = evidence_id_for(normalized.id) not in known_evids
@@ -474,7 +490,8 @@ def apply_plan(graph, plan, dry_run: bool = False) -> dict:
             "    v.source = $source, v.source_id = $source_id, v.source_url = $source_url,\n"
             "    v.cve_id = $cve_id, v.published_at = $published_at,\n"
             "    v.modified_at = $modified_at, v.ingested_at = $ingested_at,\n"
-            "    v.references = $references, v.data_source = $data_source",
+            "    v.references = $references, v.data_source = $data_source,\n"
+            "    v.affected = $affected",
             {
                 "id": op["id"], "severity": op["severity"],
                 "description": op["description"], "source": op["source"],
@@ -485,6 +502,9 @@ def apply_plan(graph, plan, dry_run: bool = False) -> dict:
                 # rejected), so references are stored as a JSON string.
                 "references": json.dumps(op["references"]),
                 "data_source": op["data_source"],
+                # Normalized affected ranges (JSON) for Phase 7 offline
+                # upgrade evaluation; see build_upsert_plan.
+                "affected": json.dumps(op["affected"]),
             },
         )
         executed["vulnerability_nodes"] += 1

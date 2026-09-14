@@ -11,6 +11,7 @@ API.
 - **Phase 4** — deterministic risk & impact intelligence engine (`graph/risk.py`) + `GET /api/risk/{artifact_id}`.
 - **Phase 5** — evidence & provenance layer (`:Evidence`, `SUPPORTED_BY`/`DESCRIBES`, `risk.factors.evidence`) + `GET /api/evidence/{artifact_id}`.
 - **Phase 6** — public security-intelligence ingestion (`graph/osv.py`, real OSV API) with full provenance, deterministic version mapping, MERGE-idempotent upserts + a prepared-but-not-executed GraphRAG SDK integration point (`graph/graphrag_schema.py`).
+- **Phase 7** — graph-native counterfactual remediation intelligence (`graph/counterfactual.py`): non-mutating `remove` / `upgrade` / `isolate` simulations with baseline/counterfactual/delta/paths/assessment via `POST /api/counterfactual/{artifact_id}`.
 
 > If artifact X becomes unsafe, which downstream systems are affected, through which paths,
 > how severe is the impact, and what evidence supports the conclusions?
@@ -89,9 +90,10 @@ public-source attributions (Phase 5).
 - `graph/schema.cypher` — indexes (model decisions/comments)
 - `graph/seed.cypher` — deterministic synthetic seed data (idempotent via `MERGE`); incl. isolated `P3/PV3` (pyyaml 5.3) fixture for Phase 6
 - `graph/seed.py` — applies schema + seed to FalkorDB
-- `graph/verify.py` — traversal / negative / incident checks + Phase 3/4/5/6 tests (Phase 6 unit checks run with NO database)
+- `graph/verify.py` — traversal / negative / incident checks + Phase 3/4/5/6/7 tests (Phase 6 unit checks run with NO database)
 - `graph/risk.py` — Phase 4 deterministic risk engine + Phase 5 evidence factor
 - `graph/osv.py` — Phase 6 public security-intelligence ingestion (OSV client, normalizer, version matcher, upsert plan, CLI)
+- `graph/counterfactual.py` — Phase 7 counterfactual remediation engine (remove/upgrade/isolate, non-mutating)
 - `graph/graphrag_schema.py` — Phase 6 GraphRAG SDK integration point (ontologized, import-safe, NOT executed)
 
 ## Commands (from repo root, with FalkorDB running)
@@ -387,6 +389,9 @@ severity while the `evidence` factor stays neutral (`confidence` unknown, never 
 ### Seeded mapping target
 `seed.cypher` adds an isolated `P3/PV3` (`pyyaml 5.3`, ecosystem `PyPI`); PV3 has **no
 edges** into the D1 system, so all Phase 2/3/4/5 results and tests are unchanged.
+Phase 7 adds one deterministic edge `MV3-[:DEPENDS_ON]->PV3` so PV3's blast radius
+(`MV3 → A2 → APP3 → DEP3`) matches the counterfactual walk-through in the Phase 7
+section below — it still never reaches D1.
 
 ### Live expectations for `pyyaml 5.3` (validated against the real OSV API)
 | CVE | OSV records | 5.3 mapping |
@@ -421,3 +426,100 @@ for unstructured advisories only.
   `python -m graph.verify` (auto-degrades to unit-only mode when FalkorDB is down).
 - Integration checks (P6, P10–P12) — live OSV ingestion, upsert detection,
   post-ingestion provenance/risk, failure isolation — require a running FalkorDB.
+
+## Counterfactual Remediation Intelligence (Phase 7)
+
+`graph/counterfactual.py` answers **"what if we remediate artifact X?"** with a
+deterministic, **non-mutating** simulation. FalkorDB performs all reachability /
+path / production reasoning; Python only orchestrates and computes deltas.
+
+```
+POST /api/counterfactual/{artifact_id}
+{ "action": "remove" | "upgrade" | "isolate",
+  "target_version": "6.0",  // upgrade only (required)
+  "target_id": "...",       // defaults to artifact_id
+  "application_id": "..." } // isolate convenience alias for target_id
+```
+
+### Guarantees (Phase 7)
+- **The graph is NEVER mutated.** No `DELETE` / `DETACH` / temporary properties /
+  relationships / rollback. Simulations use a query-time path exclusion added to every
+  traversal:
+  ```cypher
+  WHERE all(n IN nodes(p) WHERE NOT n.id IN $blocked)
+  ```
+  e.g. `remove MV1` re-runs D1's traversal with `$blocked = ["MV1"]`, so all paths
+  through MV1 disappear — nothing is deleted.
+- **Exactly three closed-set actions.** No generic scenario framework.
+- **UPGRADE reuses the Phase 6 OSV + PEP 440 rules.** Each ingested `:Vulnerability`
+  now persists its normalized `affected` ranges (`v.affected`, JSON), so a target
+  version is re-evaluated offline (no OSV call) with the *same* semantics as Phase 6
+  mapping. Security states are `known_affected` / `known_unaffected` / `unknown` —
+  **an `unknown` state is never treated as "safe"** (`assessment.status = "unknown"`).
+  No fuzzy logic, no "major > current = safe".
+- **Deterministic assessment** (no LLM):
+  - `effective` — baseline blast radius eliminated (`total_affected 9 → 0`).
+  - `partially_effective` — at least one deterministic reduction (fewer paths,
+    fewer production apps, lower risk, etc.).
+  - `no_material_change` — no deterministic improvement (e.g. still-vulnerable upgrade).
+  - `unknown` — upgrade security state could not be established.
+- **Delta conventions** — `*_delta = counterfactual − baseline` (negative =
+  improvement) and `*_reduction = baseline − counterfactual` (positive = improvement),
+  covering blast radius, production impact, propagation depth, incidents,
+  vulnerability exposure, and risk score (`risk_level_before` / `risk_level_after`).
+
+### Example walk-through (seeded graph)
+PV3 now carries the edge `MV3-[:DEPENDS_ON]->PV3`, so its blast radius is
+`MV3 → A2 → APP3 → DEP3` (4 downstream nodes, 1 production app).
+
+| Request | Baseline → counterfactual | Assessment |
+|---------|---------------------------|------------|
+| `remove D1` | blast 9 → 0, production 2 → 0, risk 74 → 0 | `effective` |
+| `remove MV1` (target of D1) | blast 9 → 4, risk 74 → 62 | `partially_effective` (APP1/APP5 paths eliminated, APP2/APP4 remain) |
+| `isolate APP1` (from D1) | production 2 → 1 | `partially_effective` |
+| `upgrade PV3 → 6.0` | severity critical → none (known_unaffected), risk 56 → 47 | `partially_effective` (topology unchanged) |
+| `upgrade PV3 → 5.1.2` | still `known_affected` (critical kept) | `no_material_change` |
+| `upgrade PV1 → 2.0` | no OSV data → `unknown` | `unknown` (never "safe") |
+
+### Response shape
+```jsonc
+{
+  "artifact_id": "D1", "action": "remove",
+  "target": { "id": "D1", "type": "Dataset" },
+  "model": { "rule_version": 1, "mutating": false, "max_propagation_depth": 8 },
+  "baseline":   { "blast_radius": {...}, "affected_nodes": [...], "affected_applications": [...] },
+  "counterfactual": { "blast_radius": {...}, "affected_nodes": [...], "security_state": "not_applicable" },
+  "delta": {
+    "blast_radius_delta": -9, "blast_radius_reduction": 9,
+    "production_impact_delta": -2, "production_impact_reduction": 2,
+    "propagation_depth_delta": -3, "propagation_depth_reduction": 3,
+    "incident_delta": -2, "incident_reduction": 2,
+    "vulnerability_delta": 0, "vulnerability_reduction": 0,
+    "risk_score_delta": -74, "risk_reduction": 74,
+    "risk_level_before": "VERY_HIGH", "risk_level_after": "LOW"
+  },
+  "paths": {
+    "eliminated": [ { "application": {"id":"APP1"}, "hops": 2, "path": {...} } ],
+    "remaining": []
+  },
+  "assessment": { "status": "effective", "reason": "remediation eliminates the entire downstream blast radius (9 -> 0)..." }
+}
+```
+
+### Behavior table (Phase 7 API)
+| Case | Result |
+|------|--------|
+| Unknown action | `400` |
+| `upgrade` without / invalid `target_version` | `400` |
+| `isolate` target that is not `Application`/`Deployment`; `upgrade` target not `PackageVersion` | `400` |
+| Unknown artifact or target | `404` |
+| FalkorDB down / query failure | `503` |
+
+### Verification (Phase 7, C1–C15)
+- Unit (C11, C12, C14) — invalid action / invalid `target_version` rejected **before** any
+  DB query; DB failure propagates (→ 503). Run with **no database**.
+- Integration (C1–C10, C13, C15) — live FalkorDB: REMOVE reachability, UPGRADE
+  `known_unaffected` / still-`known_affected` truthfulness, `unknown` versions, production
+  delta, eliminated/remaining paths, risk-delta parity with the Phase 4 engine,
+  byte-identical determinism, the **no-mutation guarantee**, 404, and Phase 1–6
+  regression.
