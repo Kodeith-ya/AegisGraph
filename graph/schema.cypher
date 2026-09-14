@@ -84,14 +84,14 @@
 // idempotent (MERGE dedups) and the process simple.
 // ============================================================
 
-CREATE INDEX FOR (n:Dataset) ON (n.id)
-CREATE INDEX FOR (n:Model) ON (n.id)
-CREATE INDEX FOR (n:ModelVersion) ON (n.id)
-CREATE INDEX FOR (n:Package) ON (n.id)
-CREATE INDEX FOR (n:PackageVersion) ON (n.id)
-CREATE INDEX FOR (n:Agent) ON (n.id)
-CREATE INDEX FOR (n:Application) ON (n.id)
-CREATE INDEX FOR (n:Deployment) ON (n.id)
-CREATE INDEX FOR (n:Vulnerability) ON (n.id)
-CREATE INDEX FOR (n:Incident) ON (n.id)
-CREATE INDEX FOR (n:Evidence) ON (n.id)
+CREATE INDEX FOR (n:Dataset) ON (n.id);
+CREATE INDEX FOR (n:Model) ON (n.id);
+CREATE INDEX FOR (n:ModelVersion) ON (n.id);
+CREATE INDEX FOR (n:Package) ON (n.id);
+CREATE INDEX FOR (n:PackageVersion) ON (n.id);
+CREATE INDEX FOR (n:Agent) ON (n.id);
+CREATE INDEX FOR (n:Application) ON (n.id);
+CREATE INDEX FOR (n:Deployment) ON (n.id);
+CREATE INDEX FOR (n:Vulnerability) ON (n.id);
+CREATE INDEX FOR (n:Incident) ON (n.id);
+CREATE INDEX FOR (n:Evidence) ON (n.id);

@@ -23,10 +23,18 @@ from db import get_graph  # noqa: E402
 
 def run_cypher_file(graph, path: Path) -> int:
     """Execute all statements in a .cypher file. Returns count executed."""
-    statements = [s.strip() for s in path.read_text().split(";") if s.strip()]
+    lines = [line.split("//", 1)[0].rstrip("\r\n") for line in path.read_text().splitlines()]
+    statements = [s.strip() for s in "\n".join(lines).split(";") if s.strip()]
+    executed = 0
     for stmt in statements:
-        graph.query(stmt)
-    return len(statements)
+        try:
+            graph.query(stmt)
+        except Exception as exc:  # noqa: BLE001 — idempotent schema re-run
+            if "already indexed" in str(exc):
+                continue
+            raise
+        executed += 1
+    return executed
 
 
 def main():

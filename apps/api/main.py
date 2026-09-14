@@ -3,6 +3,13 @@ from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Response, Query
 
+# Make `apps/api` importable (this module lives in apps/api and imports `db`
+# via a plain top-level import; uvicorn must be able to resolve it regardless
+# of the CWD it is launched from).
+API_DIR = Path(__file__).resolve().parent
+if str(API_DIR) not in sys.path:
+    sys.path.insert(0, str(API_DIR))
+
 from db import get_graph
 
 # Expose the repo-root `graph` package (graph/queries.py) so the

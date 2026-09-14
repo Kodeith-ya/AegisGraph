@@ -127,11 +127,27 @@ def _edge_dict(edge) -> dict:
 
 
 def _path_dict(path) -> dict:
-    """Flatten a FalkorDB Path into {nodes: [...], edges: [...]}."""
-    return {
-        "nodes": [_node_dict(n) for n in path.nodes()],
-        "edges": [_edge_dict(e) for e in path.edges()],
-    }
+    """Flatten a FalkorDB Path into {nodes: [...], edges: [...]}.
+
+    FalkorDB Path edges reference their endpoints by internal node id
+    (int), not by Node objects. A path is always a chain
+    n0 -e0- n1 -e1- n2 ... so we pair each edge's endpoints with the
+    path's node list positionally instead of trusting edge.src_node /
+    edge.dest_node types.
+    """
+    nodes = list(path.nodes())
+    edges = []
+    for i, e in enumerate(path.edges()):
+        edge = {
+            "type": getattr(e, "relation", None),
+            "properties": dict(getattr(e, "properties", None) or {}),
+        }
+        if i < len(nodes):
+            edge["src"] = _node_dict(nodes[i]).get("id")
+        if i + 1 < len(nodes):
+            edge["dest"] = _node_dict(nodes[i + 1]).get("id")
+        edges.append(edge)
+    return {"nodes": [_node_dict(n) for n in nodes], "edges": edges}
 
 
 def resolve_artifact(graph, artifact_id: str):
@@ -307,6 +323,11 @@ def evidence_for(graph, artifact_id: str):
     queries = (
         # Evidence that describes the artifact directly.
         ("MATCH (a {id: $id})<-[:DESCRIBES]-(e:Evidence) RETURN e, a.id AS aid",
+         "described_artifacts"),
+        # Evidence that describes a vulnerability linked FROM this artifact
+        # via HAS_VULNERABILITY (e.g. public OSV evidence for a PackageVersion).
+        ("MATCH (a {id: $id})-[:HAS_VULNERABILITY]->(v)<-[:DESCRIBES]-(e:Evidence) "
+         "RETURN e, v.id AS vid",
          "described_artifacts"),
         # Evidence supporting an incident that affects the artifact.
         ("MATCH (a {id: $id})<-[:AFFECTS]-(i:Incident)-[:SUPPORTED_BY]->(e:Evidence) RETURN e, i.id AS iid",

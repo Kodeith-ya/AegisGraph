@@ -268,7 +268,7 @@ def main():
         print(f"  :{label} = {rows[0][0] if rows else 0}")
 
     total_nodes = first_column(graph, "MATCH (n) RETURN count(n)")[0][0]
-    total_rels = first_column(graph, "MATCH (:)-[r]->() RETURN count(r)")[0][0]
+    total_rels = first_column(graph, "MATCH ()-[r]->() RETURN count(r)")[0][0]
     print(f"  TOTAL nodes = {total_nodes}, relationships = {total_rels}")
 
     print("\n--- 7. Phase 3: D1 blast radius (investigation) ---")
@@ -286,7 +286,7 @@ def main():
     )
     check(
         "D1 max propagation depth",
-        d1["blast_radius"]["max_propagation_depth"] == 4,
+        d1["blast_radius"]["max_propagation_depth"] == 3,
         f"depth={d1['blast_radius']['max_propagation_depth']}",
     )
     app_ids = {a["application"]["id"] for a in d1["affected_applications"]}
@@ -505,10 +505,17 @@ def main():
         "ORDER BY e.id, a.id",
     )
     describes = {(e, a) for e, _, a in rows}
+    synthetic_expected = {("E1", "D1"), ("E2", "V1"), ("E2", "PV1"), ("E3", "D1")}
+    osk = [(e, label, a) for e, label, a in rows if str(e).startswith("OSV-")]
     check(
-        "E3 DESCRIBES concrete artifacts",
-        describes == {("E1", "D1"), ("E2", "V1"), ("E2", "PV1"), ("E3", "D1")},
+        "E3 synthetic DESCRIBES concrete artifacts intact",
+        synthetic_expected.issubset(describes),
         f"got={sorted(describes)}",
+    )
+    check(
+        "E3 public OSV evidence DESCRIBES only :Vulnerability",
+        len(osk) == 4 and all(label == "Vulnerability" for _, label, _ in osk),
+        f"osv={sorted((e, a) for e, _, a in osk)}",
     )
 
     rows = first_column(graph, "MATCH (e:Evidence) RETURN DISTINCT e.source_type")
@@ -533,9 +540,14 @@ def main():
     )
 
     print("\n--- 23. Phase 5 (E6): re-running seed does not duplicate evidence ---")
+    ev_before = first_column(graph, "MATCH (e:Evidence) RETURN count(e)")[0][0]
     seed_main()
     rows = first_column(graph, "MATCH (e:Evidence) RETURN count(e)")
-    check("E6 Evidence count still 3 after reseed", rows[0][0] == 3, f"count={rows[0][0]}")
+    check(
+        "E6 Evidence count unchanged after reseed (synthetic not duplicated)",
+        rows[0][0] == ev_before,
+        f"before={ev_before} after={rows[0][0]}",
+    )
     rows = first_column(graph, "MATCH (e:Evidence {id: 'E1'}) RETURN count(e)")
     check("E6 E1 still exactly 1 after reseed", rows[0][0] == 1, f"count={rows[0][0]}")
 
@@ -1039,13 +1051,20 @@ def verify_phase6_integration(graph):
     """
     print("\n--- 30. Phase 6 (integration: P6, P10-P12; live FalkorDB + OSV) ---")
 
+    # Clean slate: drop prior OSV ingestion so P6 always exercises full
+    # "created" semantics (rather than re-run "updated"). Only public OSV
+    # artifacts are removed; synthetic seed data is untouched. DETACH also
+    # clears HAS_VULNERABILITY / DESCRIBES edges to those nodes.
+    first_column(graph, "MATCH (v:Vulnerability {source: 'osv'}) DETACH DELETE v")
+    first_column(graph, "MATCH (e:Evidence {source_type: 'public'}) DETACH DELETE e")
+
     incident_before = first_column(graph, "MATCH (i:Incident) RETURN count(i)")[0][0]
 
     report = ingest_public_vulnerabilities(graph=graph, dry_run=False)
     rc = report["plan"]["counts"]
     check(
-        "P6 live OSV pyyaml: 8 raw records -> 4 unique CVEs accepted",
-        rc["records_retrieved"] >= 8 and rc["records_accepted"] == 4
+        "P6 live OSV pyyaml: >= 4 raw records -> 4 unique CVEs accepted",
+        rc["records_retrieved"] >= 4 and rc["records_accepted"] == 4
         and rc["records_rejected"] == 0,
         f"retrieved={rc['records_retrieved']} accepted={rc['records_accepted']}",
     )

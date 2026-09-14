@@ -87,7 +87,7 @@ SET pv3.name = 'pyyaml 5.3',
     pv3.ecosystem = 'PyPI',
     pv3.data_source = 'synthetic';
 
-MERGE (p3)-[:HAS_VERSION]->(pv3);
+MATCH (p3:Package {id: 'P3'}), (pv3:PackageVersion {id: 'PV3'}) MERGE (p3)-[:HAS_VERSION]->(pv3);
 
 // ---- Agents ----
 MERGE (a1:Agent {id: 'A1'})
@@ -177,45 +177,45 @@ SET inc2.type = 'vulnerability',
     inc2.data_source = 'synthetic';
 
 // ---- Relationships ----
-MERGE (m1)-[:HAS_VERSION]->(mv1);
-MERGE (m2)-[:HAS_VERSION]->(mv2);
+MATCH (m1:Model {id: 'M1'}), (mv1:ModelVersion {id: 'MV1'}) MERGE (m1)-[:HAS_VERSION]->(mv1);
+MATCH (m2:Model {id: 'M2'}), (mv2:ModelVersion {id: 'MV2'}) MERGE (m2)-[:HAS_VERSION]->(mv2);
 
-MERGE (mv2)-[:BASED_ON]->(mv1);
+MATCH (mv2:ModelVersion {id: 'MV2'}), (mv1:ModelVersion {id: 'MV1'}) MERGE (mv2)-[:BASED_ON]->(mv1);
 
-MERGE (mv1)-[:TRAINED_ON]->(d1);
-MERGE (mv2)-[:TRAINED_ON]->(d1);
+MATCH (mv1:ModelVersion {id: 'MV1'}), (d1:Dataset {id: 'D1'}) MERGE (mv1)-[:TRAINED_ON]->(d1);
+MATCH (mv2:ModelVersion {id: 'MV2'}), (d1:Dataset {id: 'D1'}) MERGE (mv2)-[:TRAINED_ON]->(d1);
 
-MERGE (p1)-[:HAS_VERSION]->(pv1);
-MERGE (p1)-[:HAS_VERSION]->(pv2);
+MATCH (p1:Package {id: 'P1'}), (pv1:PackageVersion {id: 'PV1'}) MERGE (p1)-[:HAS_VERSION]->(pv1);
+MATCH (p1:Package {id: 'P1'}), (pv2:PackageVersion {id: 'PV2'}) MERGE (p1)-[:HAS_VERSION]->(pv2);
 
-MERGE (mv1)-[:DEPENDS_ON]->(pv1);
-MERGE (mv2)-[:DEPENDS_ON]->(pv1);
-MERGE (mv3)-[:DEPENDS_ON]->(pv2);
+MATCH (mv1:ModelVersion {id: 'MV1'}), (pv1:PackageVersion {id: 'PV1'}) MERGE (mv1)-[:DEPENDS_ON]->(pv1);
+MATCH (mv2:ModelVersion {id: 'MV2'}), (pv1:PackageVersion {id: 'PV1'}) MERGE (mv2)-[:DEPENDS_ON]->(pv1);
+MATCH (mv3:ModelVersion {id: 'MV3'}), (pv2:PackageVersion {id: 'PV2'}) MERGE (mv3)-[:DEPENDS_ON]->(pv2);
 
-MERGE (pv1)-[:HAS_VULNERABILITY]->(v1);
+MATCH (pv1:PackageVersion {id: 'PV1'}), (v1:Vulnerability {id: 'V1'}) MERGE (pv1)-[:HAS_VULNERABILITY]->(v1);
 
-MERGE (a1)-[:POWERED_BY]->(mv1);
-MERGE (a1)-[:USES_TOOL]->(pv1);
-MERGE (a2)-[:POWERED_BY]->(mv3);
-MERGE (a2)-[:USES_TOOL]->(pv2);
+MATCH (a1:Agent {id: 'A1'}), (mv1:ModelVersion {id: 'MV1'}) MERGE (a1)-[:POWERED_BY]->(mv1);
+MATCH (a1:Agent {id: 'A1'}), (pv1:PackageVersion {id: 'PV1'}) MERGE (a1)-[:USES_TOOL]->(pv1);
+MATCH (a2:Agent {id: 'A2'}), (mv3:ModelVersion {id: 'MV3'}) MERGE (a2)-[:POWERED_BY]->(mv3);
+MATCH (a2:Agent {id: 'A2'}), (pv2:PackageVersion {id: 'PV2'}) MERGE (a2)-[:USES_TOOL]->(pv2);
 
-MERGE (app1)-[:USES_MODEL]->(mv1);
-MERGE (app1)-[:USES_AGENT]->(a1);
-MERGE (app2)-[:USES_MODEL]->(mv2);
-MERGE (app3)-[:USES_AGENT]->(a2);
-MERGE (app4)-[:USES_MODEL]->(mv2);
-MERGE (app5)-[:USES_MODEL]->(mv1);
+MATCH (app1:Application {id: 'APP1'}), (mv1:ModelVersion {id: 'MV1'}) MERGE (app1)-[:USES_MODEL]->(mv1);
+MATCH (app1:Application {id: 'APP1'}), (a1:Agent {id: 'A1'}) MERGE (app1)-[:USES_AGENT]->(a1);
+MATCH (app2:Application {id: 'APP2'}), (mv2:ModelVersion {id: 'MV2'}) MERGE (app2)-[:USES_MODEL]->(mv2);
+MATCH (app3:Application {id: 'APP3'}), (a2:Agent {id: 'A2'}) MERGE (app3)-[:USES_AGENT]->(a2);
+MATCH (app4:Application {id: 'APP4'}), (mv2:ModelVersion {id: 'MV2'}) MERGE (app4)-[:USES_MODEL]->(mv2);
+MATCH (app5:Application {id: 'APP5'}), (mv1:ModelVersion {id: 'MV1'}) MERGE (app5)-[:USES_MODEL]->(mv1);
 
-MERGE (dep1)-[:DEPLOYS]->(app1);
-MERGE (dep2)-[:DEPLOYS]->(app2);
-MERGE (dep3)-[:DEPLOYS]->(app3);
+MATCH (dep1:Deployment {id: 'DEP1'}), (app1:Application {id: 'APP1'}) MERGE (dep1)-[:DEPLOYS]->(app1);
+MATCH (dep2:Deployment {id: 'DEP2'}), (app2:Application {id: 'APP2'}) MERGE (dep2)-[:DEPLOYS]->(app2);
+MATCH (dep3:Deployment {id: 'DEP3'}), (app3:Application {id: 'APP3'}) MERGE (dep3)-[:DEPLOYS]->(app3);
 
 // APP_UNRELATED + DEP_UNRELATED intentionally left without any
 // edge to D1 so they can serve as negative-control nodes.
 
 // ---- Incidents connect directly to concrete artifacts ----
-MERGE (inc1)-[:AFFECTS]->(d1);
-MERGE (inc2)-[:AFFECTS]->(v1);
+MATCH (inc1:Incident {id: 'INC1'}), (d1:Dataset {id: 'D1'}) MERGE (inc1)-[:AFFECTS]->(d1);
+MATCH (inc2:Incident {id: 'INC2'}), (v1:Vulnerability {id: 'V1'}) MERGE (inc2)-[:AFFECTS]->(v1);
 
 // ============================================================
 // Evidence & provenance (Phase 5)
@@ -255,11 +255,11 @@ SET e3.title = 'Atlas Vision Dataset integrity scan anomalies (demo)',
     e3.description = 'Synthetic integrity scan flagging anomalies in the Atlas Vision Dataset (D1). Demo data, not a real public report.';
 
 // ---- Incident -> Evidence (SUPPORTED_BY) ----
-MERGE (inc1)-[:SUPPORTED_BY]->(e1);
-MERGE (inc2)-[:SUPPORTED_BY]->(e2);
+MATCH (inc1:Incident {id: 'INC1'}), (e1:Evidence {id: 'E1'}) MERGE (inc1)-[:SUPPORTED_BY]->(e1);
+MATCH (inc2:Incident {id: 'INC2'}), (e2:Evidence {id: 'E2'}) MERGE (inc2)-[:SUPPORTED_BY]->(e2);
 
 // ---- Evidence -> concrete artifact (DESCRIBES) ----
-MERGE (e1)-[:DESCRIBES]->(d1);
-MERGE (e2)-[:DESCRIBES]->(v1);
-MERGE (e2)-[:DESCRIBES]->(pv1);
-MERGE (e3)-[:DESCRIBES]->(d1);
+MATCH (e1:Evidence {id: 'E1'}), (d1:Dataset {id: 'D1'}) MERGE (e1)-[:DESCRIBES]->(d1);
+MATCH (e2:Evidence {id: 'E2'}), (v1:Vulnerability {id: 'V1'}) MERGE (e2)-[:DESCRIBES]->(v1);
+MATCH (e2:Evidence {id: 'E2'}), (pv1:PackageVersion {id: 'PV1'}) MERGE (e2)-[:DESCRIBES]->(pv1);
+MATCH (e3:Evidence {id: 'E3'}), (d1:Dataset {id: 'D1'}) MERGE (e3)-[:DESCRIBES]->(d1);

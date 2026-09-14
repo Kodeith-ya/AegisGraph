@@ -481,7 +481,10 @@ def apply_plan(graph, plan, dry_run: bool = False) -> dict:
                 "source_id": op["source_id"], "source_url": op["source_url"],
                 "cve_id": op["cve_id"], "published_at": op["published_at"],
                 "modified_at": op["modified_at"], "ingested_at": op["ingested_at"],
-                "references": op["references"], "data_source": op["data_source"],
+                # FalkorDB properties are primitives only (arrays of dicts are
+                # rejected), so references are stored as a JSON string.
+                "references": json.dumps(op["references"]),
+                "data_source": op["data_source"],
             },
         )
         executed["vulnerability_nodes"] += 1
