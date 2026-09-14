@@ -12,6 +12,7 @@ API.
 - **Phase 5** — evidence & provenance layer (`:Evidence`, `SUPPORTED_BY`/`DESCRIBES`, `risk.factors.evidence`) + `GET /api/evidence/{artifact_id}`.
 - **Phase 6** — public security-intelligence ingestion (`graph/osv.py`, real OSV API) with full provenance, deterministic version mapping, MERGE-idempotent upserts + a prepared-but-not-executed GraphRAG SDK integration point (`graph/graphrag_schema.py`).
 - **Phase 7** — graph-native counterfactual remediation intelligence (`graph/counterfactual.py`): non-mutating `remove` / `upgrade` / `isolate` simulations with baseline/counterfactual/delta/paths/assessment via `POST /api/counterfactual/{artifact_id}`.
+- **Phase 8** — controlled, evidence-grounded AI investigator (`graph/investigator.py`): an optional explanation layer on top of the deterministic pipeline (FalkorDB → evidence → risk → counterfactual → context → LLM → validated, grounded report) via `POST /api/investigate/{artifact_id}/explain`. The LLM can synthesize and explain deterministic facts but can never compute, override, or invent them.
 
 > If artifact X becomes unsafe, which downstream systems are affected, through which paths,
 > how severe is the impact, and what evidence supports the conclusions?
@@ -90,10 +91,11 @@ public-source attributions (Phase 5).
 - `graph/schema.cypher` — indexes (model decisions/comments)
 - `graph/seed.cypher` — deterministic synthetic seed data (idempotent via `MERGE`); incl. isolated `P3/PV3` (pyyaml 5.3) fixture for Phase 6
 - `graph/seed.py` — applies schema + seed to FalkorDB
-- `graph/verify.py` — traversal / negative / incident checks + Phase 3/4/5/6/7 tests (Phase 6 unit checks run with NO database)
+- `graph/verify.py` — traversal / negative / incident checks + Phase 3/4/5/6/7/8 tests (Phase 6/8 unit checks run with NO database)
 - `graph/risk.py` — Phase 4 deterministic risk engine + Phase 5 evidence factor
 - `graph/osv.py` — Phase 6 public security-intelligence ingestion (OSV client, normalizer, version matcher, upsert plan, CLI)
 - `graph/counterfactual.py` — Phase 7 counterfactual remediation engine (remove/upgrade/isolate, non-mutating)
+- `graph/investigator.py` — Phase 8 evidence-grounded AI investigator (deterministic context projection, provider client, grounding validation)
 - `graph/graphrag_schema.py` — Phase 6 GraphRAG SDK integration point (ontologized, import-safe, NOT executed)
 
 ## Commands (from repo root, with FalkorDB running)
@@ -414,10 +416,12 @@ python -m graph.osv
 `graph/graphrag_schema.py` documents the AegisGraph ontology (`Vulnerability`,
 `Package`, `PackageVersion`, `Evidence`, `Incident` + `HAS_VULNERABILITY`/`DESCRIBES`)
 and `build_graphrag_schema()` returns a FalkorDB/GraphRAG-SDK `GraphSchema` **only** when
-the SDK is installed. It requires a live FalkorDB and an LLM/embedder via LiteLLM —
-neither exists in this environment, so the SDK is **not installed and not executed**.
-Structured OSV JSON is normalized deterministically instead; GraphRAG is a future option
-for unstructured advisories only.
+the SDK is installed (both the legacy 0.8.x `EntityType(name=...)` and the current
+`EntityType(label=...)` / `GraphRAG(llm=LiteLLM(...), embedder=...)` constructors are
+handled). It requires a live FalkorDB and an LLM/embedder via LiteLLM — neither exists in
+this environment, so the SDK is **not installed and not executed**. Structured OSV JSON is
+normalized deterministically instead; GraphRAG remains a build-pipeline option for
+unstructured advisories only — it is independent of the Phase 8 investigator.
 
 ### Verification
 - Unit checks (P1–P5, P7–P9, P13, P14) — OSV fetch contract, validation, normalization,
@@ -523,3 +527,90 @@ PV3 now carries the edge `MV3-[:DEPENDS_ON]->PV3`, so its blast radius is
   delta, eliminated/remaining paths, risk-delta parity with the Phase 4 engine,
   byte-identical determinism, the **no-mutation guarantee**, 404, and Phase 1–6
   regression.
+
+## Evidence-Grounded AI Investigator (Phase 8)
+
+`graph/investigator.py` answers **"explain this investigation in plain language"** — but
+the AI never reasons about the graph. It SYNTHESIZES and EXPLAINS the output of the
+deterministic pipeline, nothing more.
+
+```
+resolve -> investigate -> evidence -> risk -> (opt.) counterfactual
+      -> project bounded CONTEXT (secret-guarded)
+      -> ONE LLM call (explain/synthesize, temperature 0)
+      -> validate_report()  (schema + grounding cross-checks) -> report
+```
+
+### Principles (Phase 8)
+- **The LLM comes LAST.** The deterministic engine (FalkorDB + `graph.risk` +
+  `graph.counterfactual`) runs first and decides. There is **no** LLM→tool/Cypher loop,
+  no multi-agent orchestration, no autonomous remediation cycle.
+- **Grounding is enforced, not requested.** `validate_report()` REJECTS any report that
+  contradicts the context: wrong `risk_score` / `risk_level`, vulnerability status
+  `unknown` flipped to `known`/safe, evidence ids absent from the context, paths that do
+  not exist in it, invented `affected_surface` artifacts, or remediation deltas that do
+  not match the executed counterfactual.
+- **Unknown stays unknown.** The model must mirror the deterministic
+  `vulnerability.status` (`unknown` included) and never treat an unknown security state
+  as "safe".
+- **No mutations.** Explaining an investigation never changes the graph (verified by
+  before/after node/relationship counts under both success and LLM-failure paths).
+- **No secrets.** The context is built from a whitelist of engine outputs only and a
+  guard scans the serialized context/messages for any configured environment secret
+  (raising 503 instead of leaking).
+- **Bounded everything.** Context lists are capped and truncation is explicit
+  (`truncated` flags); the report has a size ceiling; timeout defaults to 30s with one
+  bounded retry (drop `response_format` for providers that reject it).
+
+### `POST /api/investigate/{artifact_id}/explain`
+```jsonc
+// request
+{ "question": "How bad is this, and what were we told to do?",
+  "counterfactual": { "action": "upgrade", "target_version": "6.0" } }  // OPTIONAL
+```
+- `counterfactual` (when present) MUST be a well-formed deterministic counterfactual
+  request — the engine evaluates it and the LLM only explains the result (the idempotent
+  `remove`/`upgrade`/`isolate` rules of Phase 7 apply). A malformed counterfactual is
+  rejected (`400`) **before** any graph query.
+- Response: `{ artifact_id, max_depth, processing, context, analysis }` —
+  `context` is the exact bounded deterministic fact set the model was allowed to use;
+  `analysis` is the validated, grounded report
+  (`summary` / `findings` / `risk_explanation` / `affected_surface` /
+  `evidence_summary` / `remediation` / `uncertainties` / `grounding`).
+- `query` param `max_depth` bounds traversal (default 8, max 20), same as the other
+  endpoints.
+
+### Behavior table (Phase 8 API)
+| Case | Result |
+|------|--------|
+| Invalid counterfactual request (action/version/target) | `400` |
+| Unknown artifact or remediation target | `404` |
+| LLM not configured (`INVESTIGATOR_LLM_*` unset) | `503` (clean message, no stack) |
+| Provider HTTP/network/timeout failure or malformed response | `503` |
+| Report contradicts the deterministic context | `503` (`LLMInvalidOutput`) |
+| Context would expose an environment secret | `503` (`LLMContextError`) |
+| FalkorDB down / query failure | `503` |
+
+Every deterministic endpoint (`/api/investigate`, `/api/risk`, `/api/evidence`,
+`/api/counterfactual`) keeps working with **no LLM configured** — the investigator is an
+optional explanation layer, never a dependency of the security engine.
+
+### Configuration
+```bash
+INVESTIGATOR_LLM_BASE_URL=     # OpenAI-compatible base, e.g. https://api.openai.com/v1
+INVESTIGATOR_LLM_API_KEY=
+INVESTIGATOR_LLM_MODEL=gpt-4o-mini
+INVESTIGATOR_LLM_TIMEOUT=30
+```
+
+### Verification (Phase 8, A1–A15; unit runs with no DB, integration needs live FalkorDB)
+Unit (A3–A6, A8–A14): deterministic/identical context projection and prompt messages,
+grounded output accepted, malformed/fabricated output rejected, `unknown` preserved and
+flips rejected, fabricated evidence/paths/surface rejected, risk score/level immutable,
+counterfactual deltas required and verbatim, unconfigured-provider fail-fast (raised only
+after the deterministic context build), invalid counterfactual rejected before any DB
+query, DB failure propagated, secret guard. Integration (A1–A15 on the seeded graph):
+context carries D1 (9 affected, risk 74/VERY_HIGH, evidence E1/E3), PV3→6.0 explains the
+real `upgrade` delta (risk 56→47), no-mutation under success and failure, 404, and Phase
+1–7 regression. The **live LLM call** is validated separately with real credentials and
+is reported `SKIPPED` when `INVESTIGATOR_LLM_*` are unset (as in this repository).

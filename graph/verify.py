@@ -1,4 +1,4 @@
-"""Verify the AegisGraph seed graph + Phase 3, 4, 5 & 6 behavior.
+"""Verify the AegisGraph seed graph + Phase 3, 4, 5, 6, 7 & 8 behavior.
 
 Usage:
     python -m graph.verify      # from repo root
@@ -13,7 +13,7 @@ Executes real Cypher queries and prints PASS/FAIL for:
       aliasing, CVE dedupe, version mapping matrix, plan integrity,
       plan idempotency, dry-run no-op, orchestration + failure
       isolation, determinism).
-30: Phase 6 P6, P10-P12 — INTEGRATION checks that need a LIVE
+ 30: Phase 6 P6, P10-P12 — INTEGRATION checks that need a LIVE
        FalkorDB (+ live OSV network for P6): real pyyaml ingestion,
        upsert detection, post-ingestion graph facts (public provenance,
        honest risk: public evidence w/o confidence never inflates risk,
@@ -28,8 +28,25 @@ Executes real Cypher queries and prints PASS/FAIL for:
        parity with the Phase 4 engine, determinism, no-mutation
        guarantee, unknown-artifact 404, and regression (Phase 1-6
        behavior unchanged).
+   33: Phase 8 A1-A6*, A9-A14 — UNIT checks that never need FalkorDB or
+       an LLM: deterministic context projection (determinism, ordering,
+       bounded, verbatim risk), grounding/unknown/evidence/risk/CF
+       preservation enforced by validate_report, malformed-output
+       rejection, LLM-unavailable fail-fast (no DB access), invalid
+       counterfactual -> 400 before DB access, DB failure -> propagated,
+       identical prompt messages, no-secrets guard.
+   34: Phase 8 A1/A2/A5/A7-A10/A12/A14/A15 — INTEGRATION checks that
+       need a LIVE FalkorDB (plus a LOCAL fake model; no external LLM):
+       context determinism and grounding on the real graph, evidence
+       references correspond to real evidence, the AI cannot change the
+       deterministic risk, counterfactual explanations use real deltas,
+       malformed/fabricated model output rejected safely, LLM failure
+       leaves the deterministic system + graph intact, no-mutation
+       guarantee, unknown artifact -> 404, and Phase 1-7 regression.
+       Live LLM validation is a separate manual smoke test (needs
+       INVESTIGATOR_LLM_* credentials; SKIPPED when absent).
 
-If FalkorDB is unreachable, the Phase 6 UNIT section and GraphRAG-SDK
+If FalkorDB is unreachable, the Phase 6/8 UNIT sections and GraphRAG-SDK
 availability check still run; DB-dependent sections are skipped with a
 note (live Docker/FalkorDB required).
 
@@ -37,6 +54,7 @@ NOTE: R8 (unknown artifact 404) and API-level behavior (503, depth 422)
 are covered in apps/api/main.py — see README.
 """
 import json
+import os
 import sys
 import urllib.error
 from pathlib import Path
@@ -96,6 +114,22 @@ from .osv import (  # noqa: E402
     package_version_in_affected,
     parse_severity,
     validate_osv_record,
+)
+
+from .investigator import (  # noqa: E402
+    LLMContextError,
+    LLMInvalidOutput,
+    LLMUnavailable,
+    _ENV_API_KEY,
+    _ENV_BASE_URL,
+    _guard_context,
+    _scan_for_secrets,
+    build_investigation_context,
+    compose_messages,
+    investigate as investigator_investigate,
+    project_investigation,
+    provider_configured,
+    validate_report,
 )
 
 # ----------------------------------------------------------------------
@@ -234,6 +268,7 @@ def main():
               "(live FalkorDB) skipped.\n")
         verify_phase6_unit()
         verify_phase7_unit()
+        verify_phase8_unit()
         return
 
     print("\n--- 1. Required nodes exist ---")
@@ -711,6 +746,8 @@ def main():
     verify_phase6_integration(graph)
     verify_phase7_unit()
     verify_phase7_integration(graph)
+    verify_phase8_unit()
+    verify_phase8_integration(graph)
 
 
 class _FakeUrlopen:
@@ -1458,6 +1495,574 @@ def verify_phase7_integration(graph):
         "C15 blocked=empty callers behave exactly like Phase 3 (identical paths)",
         plain == applications_paths(graph, "D1", blocked=[]),
     )
+
+
+# ----------------------------------------------------------------------
+# Phase 8 — grounded AI investigator (unit + integration).
+# A LOCAL fake model validates the investigation layer; live LLM output
+# is validated separately with INVESTIGATOR_LLM_* credentials (SKIPPED
+# when absent). The LLM is never consulted for deterministic facts.
+# ----------------------------------------------------------------------
+def _synthetic_enriched_investigation():
+    """D1-like fixture in the EXACT shape enrich_investigation() returns.
+
+    The point is to exercise the whole investigator layer (projection,
+    guard, validation) without a database: blast radius 9, production
+    apps {APP1, APP2}, evidence {E1, E3}, risk 74/VERY_HIGH, and an
+    UNKNOWN vulnerability status that the investigator must never flip.
+    """
+
+    def node(nid, type_, hops):
+        return {"id": nid, "type": type_, "hops": hops,
+                "name": nid, "description": f"synthetic {nid}"}
+
+    return {
+        "artifact": {"id": "D1", "type": "dataset", "name": "Synthetic Data",
+                     "status": "active", "description": "synthetic D1"},
+        "blast_radius": {
+            "total_affected": 9,
+            "max_propagation_depth": 3,
+            "traversal_depth_cap": 8,
+            "dependents_by_type": {"ModelVersion": 2, "Agent": 1,
+                                   "Application": 4, "Deployment": 2},
+        },
+        "affected_applications": [
+            {"application": {"id": "APP1"}, "hops": 3, "path": {
+                "nodes": [node("D1", "dataset", 0), node("MV1", "model_version", 1),
+                          node("A1", "agent", 2), node("APP1", "application", 3)],
+                "edges": [{"type": "TRAINED_ON"}, {"type": "POWERED_BY"},
+                          {"type": "USES_AGENT"}]}},
+            {"application": {"id": "APP4"}, "hops": 3, "path": {
+                "nodes": [node("D1", "dataset", 0), node("MV1", "model_version", 1),
+                          node("A1", "agent", 2), node("APP4", "application", 3)],
+                "edges": [{"type": "TRAINED_ON"}, {"type": "POWERED_BY"},
+                          {"type": "USES_AGENT"}]}},
+            {"application": {"id": "APP2"}, "hops": 2, "path": {
+                "nodes": [node("D1", "dataset", 0), node("MV2", "model_version", 1),
+                          node("APP2", "application", 2)],
+                "edges": [{"type": "TRAINED_ON"}, {"type": "USES_MODEL"}]}},
+        ],
+        "production_applications": [
+            {"application": {"id": "APP1"}, "deployment": {"id": "DEP1"}, "hops": 4},
+            {"application": {"id": "APP2"}, "deployment": {"id": "DEP2"}, "hops": 3},
+        ],
+        "incidents": [{"id": "INC1", "type": "confirmed_expanded_blast_radius",
+                       "status": "open", "description": "synthetic INC1"}],
+        "evidence": [
+            {"id": "E1", "title": "Synthetic exploit observed",
+             "source": "aegisgraph-demo-dataset", "source_type": "synthetic",
+             "confidence": 0.9, "observed_at": "2026-01-01T00:00:00Z",
+             "description": "internal incident observation"},
+            {"id": "E3", "title": "External advisory ties influence",
+             "source": "external", "source_type": "advisory",
+             "confidence": 0.7, "observed_at": "2026-01-01T00:00:00Z",
+             "description": "external advisory"},
+        ],
+        "dependencies": [
+            node("MV1", "model_version", 1), node("MV2", "model_version", 1),
+            node("A1", "agent", 2), node("APP1", "application", 3),
+            node("APP2", "application", 2), node("APP4", "application", 3),
+            node("APP5", "application", 3), node("DEP1", "deployment", 4),
+            node("DEP2", "deployment", 3),
+        ],
+        "risk": {"score": 74, "level": "VERY_HIGH",
+                 "vulnerability": {"status": "unknown", "severities": [],
+                                   "vulnerabilities": []}},
+    }
+
+
+def _synthetic_counterfactual():
+    """A REMOVE target=MV1 result mirroring Phase 7's deterministic shape."""
+    return {
+        "artifact_id": "D1",
+        "action": "remove",
+        "target": {"id": "MV1", "type": "model_version", "version": None},
+        "counterfactual": {
+            "security_state": "known_affected",
+            "matched_vulnerabilities": [],
+        },
+        "assessment": {
+            "status": "partially_effective",
+            "reason": "removing MV1 blocks the MV1 backbone (APP1, APP5) "
+                      "but leaves the MV2 backbone (APP2, APP4)",
+        },
+        "delta": {
+            "blast_radius_reduction": 5,
+            "blast_radius_delta": -5,
+            "production_impact_reduction": 1,
+            "production_impact_delta": -1,
+            "vulnerability_reduction": 0.0,
+            "vulnerability_delta": 0.0,
+            "risk_reduction": 12,
+            "risk_score_delta": -12,
+            "risk_score": {"delta": -12, "reduction": 12},
+            "risk_level_before": "VERY_HIGH",
+            "risk_level_after": "HIGH",
+        },
+        "paths": {
+            "eliminated": [{"application": {"id": "APP1"}, "hops": 3},
+                           {"application": {"id": "APP5"}, "hops": 3}],
+            "remaining": [{"application": {"id": "APP2"}, "hops": 2},
+                          {"application": {"id": "APP4"}, "hops": 3}],
+        },
+    }
+
+
+class _GroundedInvestigatorLLM:
+    """Deterministic fake model that faithfully grounds EVERYTHING.
+
+    Anything this fake states is verifiable against the context (verbatim
+    risk, real evidence ids, verbatim paths, executed-counterfactual deltas)
+    so validate_report() accepts it — the baseline for the corruption cases.
+    """
+
+    model = "fake-grounded"
+
+    def __call__(self, context, question=None):
+        inv = context["investigation"]
+        risk = context["risk"]
+        cfa = context.get("counterfactual")
+        affected_nodes = inv["affected_nodes"]
+        surface = sorted({n["id"] for n in affected_nodes}
+                         | {a["application_id"] for a in inv["affected_applications"]})
+        grounding = {
+            "artifact_id": context["artifact"]["id"],
+            "risk_score": risk["score"],
+            "risk_level": risk["level"],
+            "vulnerability_status": (risk.get("vulnerability") or {}).get("status"),
+            "evidence_ids": [e["id"] for e in context["evidence"]],
+            "affected_paths": [
+                {"nodes": list(a["path"]["nodes"]), "hops": a["hops"]}
+                for a in inv["affected_applications"]
+            ],
+            "remediation": (
+                {"action": cfa["action"],
+                 "risk_reduction": cfa["delta"]["risk_score"]["reduction"]}
+                if cfa is not None else None
+            ),
+        }
+        return {
+            "summary": f"Synthetic grounded summary for {context['artifact']['id']}",
+            "findings": [f"Deterministic blast radius: "
+                         f"{inv['blast_radius']['total_affected']} affected"],
+            "risk_explanation": f"Deterministic risk score {risk['score']} "
+                                f"({risk['level']}); vulnerability status "
+                                f"{(risk.get('vulnerability') or {}).get('status')}.",
+            "affected_surface": surface,
+            "evidence_summary": sorted(f"Evidence {e['id']}" for e in context["evidence"]),
+            "remediation": (["Analytical: the evaluated counterfactual is "
+                             "referenced by action and delta only."]
+                            if cfa is not None else []),
+            "uncertainties": ["Anything not established by the context stays unknown."],
+            "grounding": grounding,
+        }
+
+
+class _BrokenLLM:
+    """Fake model whose output corrupts one grounding dimension at a time."""
+
+    model = "fake-broken"
+
+    def __init__(self, mode):
+        self.mode = mode
+
+    def __call__(self, context, question=None):
+        if self.mode == "not-object":
+            return [1, 2, 3]
+        if self.mode == "not-json":
+            return "this is definitely not json"
+        if self.mode == "missing-fields":
+            return {"summary": "only a summary"}
+        report = _GroundedInvestigatorLLM()(context, question)
+        grounding = report["grounding"]
+        if self.mode == "wrong-risk-score":
+            grounding["risk_score"] = 0
+        elif self.mode == "wrong-risk-level":
+            grounding["risk_level"] = "LOW"
+        elif self.mode == "unknown-flipped-known":
+            grounding["vulnerability_status"] = "known"
+        elif self.mode == "fabricated-evidence":
+            grounding["evidence_ids"] = ["E999"]
+        elif self.mode == "fabricated-path":
+            first_path = context["investigation"]["affected_applications"][0]["path"]
+            grounding["affected_paths"] = [
+                {"nodes": list(first_path["nodes"]), "hops": len(first_path["nodes"]) - 1},
+                {"nodes": ["D1", "ACME", "EVIL-APP"], "hops": 2},
+            ]
+        elif self.mode == "fabricated-surface":
+            report["affected_surface"] = ["not-an-artifact"]
+        elif self.mode == "invented-remediation":
+            grounding["remediation"] = {"action": "remove", "risk_reduction": 999}
+        elif self.mode == "cf-remediation-omitted":
+            grounding["remediation"] = None
+        elif self.mode == "remediation-without-cf":
+            grounding["remediation"] = {"action": "isolate", "risk_reduction": 1}
+        return report
+
+
+def _unit_investigation_context():
+    """Run build_investigation_context against the synthetic fixture by
+    patching the THREE deterministic engine functions it composes (this is
+    the production projection path — no FalkorDB and no LLM are involved)."""
+    fixture = _synthetic_enriched_investigation()
+
+    def _enrich(graph, investigation):
+        return fixture
+
+    with mock.patch("graph.investigator.investigate_artifact", return_value={}), \
+         mock.patch("graph.investigator.enrich_investigation", side_effect=_enrich):
+        return build_investigation_context(object(), "D1")
+
+
+def verify_phase8_unit():
+    """Phase 8 (A3-A6, A8-A14): no FalkorDB, no LLM required.
+
+    Uses the synthetic fixture + a LOCAL fake model to prove the
+    investigator layer is purely deterministic in front and forbids the
+    model from contradicting the engine.
+    """
+    print("\n--- 33. Phase 8 (unit: A3-A6, A8-A14; no FalkorDB, no LLM) ---")
+
+    # ------------------------- A1/A14: deterministic context & prompts --------
+    ctx1 = _unit_investigation_context()
+    ctx2 = _unit_investigation_context()
+    check(
+        "A1 context projection is deterministic (identical on re-build)",
+        ctx1 == ctx2,
+    )
+    check(
+        "A14 identical input -> byte-for-byte identical prompt messages",
+        compose_messages(ctx1, None) == compose_messages(ctx2, None)
+        and compose_messages(ctx1, "why is this critical?")
+        == compose_messages(ctx1, "why is this critical?"),
+    )
+    ordered = [n["id"] for n in ctx1["investigation"]["affected_nodes"]]
+    check(
+        "A1 affected nodes are deterministically sorted ((hops, id) ascending)",
+        ctx1["investigation"]["affected_nodes"]
+        == sorted(ctx1["investigation"]["affected_nodes"],
+                  key=lambda n: (n["hops"], n["id"])),
+        f"order={ordered}",
+    )
+    check(
+        "A1 the context is bounded (truncation flags always present)",
+        ctx1["investigation"]["truncated"]["affected_applications"] is False
+        and ctx1["investigation"]["truncated"]["affected_nodes"] is False,
+    )
+    check(
+        "A1 risk block is copied verbatim (LLM can never change it)",
+        ctx1["risk"] == _synthetic_enriched_investigation()["risk"]
+        and ctx1["vulnerabilities"] == ctx1["risk"]["vulnerability"],
+    )
+    check(
+        "A1 no counterfactual requested -> context counterfactual is None",
+        ctx1["counterfactual"] is None,
+    )
+
+    # ------------------------- A2: grounded output accepted --------------------
+    grounded = _GroundedInvestigatorLLM()(ctx1, None)
+    validated = validate_report(grounded, ctx1)
+    check(
+        "A2 fully-grounded model output passes validation",
+        validated == grounded and isinstance(validated, dict),
+    )
+
+    # ---------------- A3/A10: malformed / unparseable model output -------------
+    for mode in ("not-object", "not-json", "missing-fields"):
+        try:
+            validate_report(_BrokenLLM(mode)(ctx1, None), ctx1)
+            raised = False
+        except LLMInvalidOutput:
+            raised = True
+        check(f"A3/A10 malformed model output rejected ({mode})", raised)
+
+    # ------------------- A4: unknown status is preserved, never flipped --------
+    check(
+        "A4 grounded report preserves deterministic UNKNOWN status",
+        grounded["grounding"]["vulnerability_status"] == "unknown",
+    )
+    for mode in ("unknown-flipped-known",):
+        try:
+            validate_report(_BrokenLLM(mode)(ctx1, None), ctx1)
+            raised = False
+        except LLMInvalidOutput:
+            raised = True
+        check("A4 model flipping UNKNOWN -> KNOWN is rejected", raised)
+
+    # --------------- A5: invented evidence / paths are rejected ----------------
+    for mode, label in (("fabricated-evidence", "fabricated evidence ids"),
+                        ("fabricated-path", "paths not in the context")):
+        try:
+            validate_report(_BrokenLLM(mode)(ctx1, None), ctx1)
+            raised = False
+        except LLMInvalidOutput:
+            raised = True
+        check(f"A5 {label} rejected", raised)
+
+    # --------------- A6: the model cannot change the risk score ---------------
+    for mode in ("wrong-risk-score", "wrong-risk-level"):
+        try:
+            validate_report(_BrokenLLM(mode)(ctx1, None), ctx1)
+            raised = False
+        except LLMInvalidOutput:
+            raised = True
+        check(f"A6 {mode.replace('-', ' ')} rejected by grounding", raised)
+
+    # --------------- A8: counterfactual deltas used verbatim -------------------
+    cf_context = project_investigation(
+        _synthetic_enriched_investigation(), _synthetic_counterfactual()
+    )
+    cf_grounded = _GroundedInvestigatorLLM()(cf_context, None)
+    cf_validated = validate_report(cf_grounded, cf_context)
+    check(
+        "A8 grounded report on a counterfactual context uses the real delta "
+        "(remove/12) verbatim",
+        cf_validated["grounding"]["remediation"]
+        == {"action": "remove", "risk_reduction": 12}
+        and cf_context["counterfactual"]["security_state"] == "known_affected",
+        f"remediation={cf_validated['grounding']['remediation']}",
+    )
+    for mode in ("invented-remediation", "cf-remediation-omitted",
+                 "remediation-without-cf"):
+        try:
+            validate_report(_BrokenLLM(mode)(cf_context, None), cf_context)
+            raised = False
+        except LLMInvalidOutput:
+            raised = True
+        check(f"A8 remediation grounding enforced ({mode})", raised)
+
+    # --------- A9/A10/A13: fail-fast ordering, invalid CF, DB failure ----------
+    calls = {"enrich": 0}
+
+    def _enrich(graph_, investigation):
+        calls["enrich"] += 1
+        return _synthetic_enriched_investigation()
+
+    with mock.patch.dict(os.environ, {_ENV_BASE_URL: "", _ENV_API_KEY: ""}):
+        check("A9 provider is not configured in this environment",
+              not provider_configured())
+        with mock.patch("graph.investigator.investigate_artifact", return_value={}), \
+             mock.patch("graph.investigator.enrich_investigation", side_effect=_enrich):
+            try:
+                investigator_investigate(object(), "D1", question="q")
+                raised = False
+            except LLMUnavailable:
+                raised = True
+            check(
+                "A9 unconfigured provider -> LLMUnavailable (API maps to 503), "
+                "raised only AFTER the deterministic context build",
+                raised and calls["enrich"] == 1,
+                f"enrich_calls={calls['enrich']}",
+            )
+            try:
+                investigator_investigate(object(), "D1", question="q",
+                                         llm_client=_BrokenLLM("not-object"))
+                raised = False
+            except LLMInvalidOutput:
+                raised = True
+            check(
+                "A10 broken injected LLM output is rejected fail-safe "
+                "(deterministic engine ran first, invalid output never returned)",
+                raised and calls["enrich"] == 2,
+                f"enrich_calls={calls['enrich']}",
+            )
+
+    try:
+        build_investigation_context(
+            _ExplodingGraph(), "D1", counterfactual={"action": "patch-all"}
+        )
+        raised = False
+    except InvalidCounterfactual:
+        raised = True
+    check(
+        "A11 invalid counterfactual action rejected BEFORE any DB query (-> 400)",
+        raised,
+        "counterfactual validation must precede all traversal",
+    )
+    try:
+        build_investigation_context(_ExplodingGraph(), "D1")
+        raised = False
+    except Exception:  # noqa: BLE001 — any transport failure must propagate
+        raised = True
+    check(
+        "A13 graph failure propagates (endpoint maps to 503, never a fake answer)",
+        raised,
+    )
+
+    # -------------------------- no-secrets guard -------------------------------
+    with mock.patch.dict(os.environ, {"FALKORDB_USERNAME": "VERIFY_UNIT_SECRET"}):
+        leaked = _scan_for_secrets("credentials VERIFY_UNIT_SECRET in text")
+        check("guard detects configured secrets in serialized text",
+              leaked == ["FALKORDB_USERNAME"], f"leaked={leaked}")
+        try:
+            _guard_context({"leak": "VERIFY_UNIT_SECRET"})
+            raised = False
+        except LLMContextError:
+            raised = True
+        check("guard raises LLMContextError when context would expose a secret",
+              raised)
+
+
+def verify_phase8_integration(graph):
+    """Phase 8 (A1/A2/A5-A10/A12/A14/A15): needs LIVE FalkorDB + a LOCAL
+    fake model. No external LLM is consulted; a live provider smoke test is
+    printed as SKIPPED when INVESTIGATOR_LLM_* credentials are missing.
+    """
+    print("\n--- 34. Phase 8 (integration: A1, A2, A5-A10, A12, A14, A15; "
+          "live FalkorDB + local fake LLM) ---")
+
+    def _state():
+        return {
+            "nodes": first_column(graph, "MATCH (n) RETURN count(n)")[0][0],
+            "rels": first_column(graph, "MATCH ()-[r]->() RETURN count(r)")[0][0],
+            "vulns": first_column(graph, "MATCH (v:Vulnerability {source:'osv'}) RETURN count(v)")[0][0],
+            "evidence": first_column(graph, "MATCH (e:Evidence {source_type:'public'}) RETURN count(e)")[0][0],
+            "incidents": first_column(graph, "MATCH (i:Incident) RETURN count(i)")[0][0],
+            "mappings": first_column(graph, "MATCH ()-[r:HAS_VULNERABILITY]->() RETURN count(r)")[0][0],
+        }
+
+    before = _state()
+
+    # ---------------- A1/A14: context & prompts deterministic on the real graph --
+    ctx_a = build_investigation_context(graph, "D1")
+    ctx_b = build_investigation_context(graph, "D1")
+    check(
+        "A1 real-graph context build is deterministic (identical re-build)",
+        ctx_a == ctx_b,
+    )
+    check(
+        "A14 identical input -> identical prompt messages on the real graph",
+        compose_messages(ctx_a, None) == compose_messages(ctx_b, None),
+    )
+
+    # ----------- A2: the context carries the deterministic D1 facts ------------
+    check(
+        "A2 D1 context carries deterministic blast radius / risk facts",
+        ctx_a["investigation"]["blast_radius"]["total_affected"] == 9
+        and ctx_a["risk"]["score"] == 74
+        and ctx_a["risk"]["level"] == "VERY_HIGH",
+        f"risk={ctx_a['risk']['score']} affected="
+        f"{ctx_a['investigation']['blast_radius']['total_affected']}",
+    )
+    check(
+        "A2 D1 production applications projected deterministically",
+        {p["application_id"] for p in ctx_a["investigation"]["production_applications"]}
+        == {"APP1", "APP2"},
+    )
+    ctx_evidence = {e["id"] for e in ctx_a["evidence"]}
+    check(
+        "A2 D1 context exposes the seeded evidence ({E1,E3} present)",
+        {"E1", "E3"} <= ctx_evidence,
+        f"evidence={sorted(ctx_evidence)}",
+    )
+    check(
+        "A2 D1 context risk == Phase 4 deterministic engine risk (verbatim)",
+        ctx_a["risk"]
+        == enrich_investigation(graph, investigate_artifact(graph, "D1"))["risk"],
+    )
+    grounded = _GroundedInvestigatorLLM()(ctx_a, None)
+    check(
+        "A2 fully-grounded model output passes validation on the real graph",
+        validate_report(grounded, ctx_a) == grounded,
+    )
+
+    # --------------- A5/A6: fabricated/contradicting output rejected ------------
+    for mode in ("fabricated-evidence", "fabricated-path", "fabricated-surface",
+                 "wrong-risk-score", "wrong-risk-level", "unknown-flipped-known"):
+        try:
+            validate_report(_BrokenLLM(mode)(ctx_a, None), ctx_a)
+            raised = False
+        except LLMInvalidOutput:
+            raised = True
+        check(f"A5/A6 {mode.replace('-', ' ')} rejected by grounding", raised)
+
+    # ------- A8: a real counterfactual context explains REAL deltas ------------
+    cf_ctx = build_investigation_context(
+        graph, "PV3", counterfactual={"action": "upgrade", "target_version": "6.0"}
+    )
+    check(
+        "A8 PV3->6.0 counterfactual context: known_unaffected, real delta",
+        cf_ctx["counterfactual"]["security_state"] == KNOWN_UNAFFECTED
+        and cf_ctx["counterfactual"]["delta"]["risk_score"]["reduction"] == 9
+        and cf_ctx["risk"]["score"] == 56,
+        f"state={cf_ctx['counterfactual']['security_state']} "
+        f"reduction={cf_ctx['counterfactual']['delta']['risk_score']['reduction']}",
+    )
+    cf_report = validate_report(_GroundedInvestigatorLLM()(cf_ctx, None), cf_ctx)
+    check(
+        "A8 grounded explanation of the upgrade uses the executed delta verbatim",
+        cf_report["grounding"]["remediation"]
+        == {"action": "upgrade", "risk_reduction": 9},
+        f"remediation={cf_report['grounding']['remediation']}",
+    )
+    for mode in ("invented-remediation", "cf-remediation-omitted",
+                 "remediation-without-cf"):
+        try:
+            validate_report(_BrokenLLM(mode)(cf_ctx, None), cf_ctx)
+            raised = False
+        except LLMInvalidOutput:
+            raised = True
+        check(f"A8 remediation grounding enforced on the real graph ({mode})", raised)
+
+    # ------------- A9/A10/A7: LLM failure is isolated, no mutation --------------
+    with mock.patch.dict(os.environ, {_ENV_BASE_URL: "", _ENV_API_KEY: ""}):
+        check("A9 provider unconfigured in this run (deterministic path unaffected)",
+              not provider_configured())
+        try:
+            investigator_investigate(graph, "D1")
+            raised = False
+        except LLMUnavailable:
+            raised = True
+        check(
+            "A9 unconfigured LLM -> LLMUnavailable (API maps to 503), "
+            "deterministic endpoints still work",
+            raised and investigate_artifact(graph, "D1")["blast_radius"]["total_affected"] == 9,
+        )
+
+    try:
+        investigator_investigate(graph, "D1", llm_client=_BrokenLLM("wrong-risk-score"))
+        raised = False
+    except LLMInvalidOutput:
+        raised = True
+    check("A10 corrupted model output is rejected end-to-end (investigate fails safe)",
+          raised)
+
+    good = investigator_investigate(graph, "D1", llm_client=_GroundedInvestigatorLLM())
+    check(
+        "A10 a grounded investigator run returns the full result shape",
+        good["artifact_id"] == "D1"
+        and good["analysis"]["grounding"]["risk_score"] == 74
+        and good["processing"]["llm"]["provider"] == "injected_test_client"
+        and good["context"]["counterfactual"] is None,
+        f"llm={good['processing']['llm']}",
+    )
+    after = _state()
+    check(
+        "A7/A9 investigator runs (success AND failure) never mutate the graph",
+        before == after,
+        f"before={before} after={after}",
+    )
+
+    # --------------------------- A12: unknown artifact -> 404 -------------------
+    try:
+        build_investigation_context(graph, "DOES_NOT_EXIST")
+        raised = False
+    except LookupError:
+        raised = True
+    check("A12 unknown artifact -> LookupError (API maps to 404)", raised)
+
+    # ------------------------------- A15: regression ---------------------------
+    d1 = investigate_artifact(graph, "D1")
+    pv3 = investigate_artifact(graph, "PV3")
+    check(
+        "A15 D1 blast radius unchanged (9) and PV3 still matches a critical vuln",
+        d1["blast_radius"]["total_affected"] == 9
+        and enrich_investigation(graph, pv3)["risk"]["vulnerability"]["severities"] == ["critical"],
+    )
+
+    if not provider_configured():
+        print("[SKIPPED] Live LLM validation — INVESTIGATOR_LLM_BASE_URL / "
+              "INVESTIGATOR_LLM_API_KEY not configured (no external credentials)")
 
 
 if __name__ == "__main__":

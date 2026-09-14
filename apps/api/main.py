@@ -23,6 +23,12 @@ if str(ROOT) not in sys.path:
 from graph.queries import evidence_for, investigate_artifact, resolve_artifact  # noqa: E402
 from graph.risk import enrich_investigation  # noqa: E402
 from graph.counterfactual import InvalidCounterfactual, analyze_counterfactual  # noqa: E402
+from graph.investigator import (  # noqa: E402
+    LLMContextError,
+    LLMInvalidOutput,
+    LLMUnavailable,
+    investigate as investigator_investigate,
+)
 
 app = FastAPI(title="AegisGraph API")
 
@@ -39,6 +45,19 @@ class CounterfactualRequest(BaseModel):
     target_version: str | None = None
     target_id: str | None = None
     application_id: str | None = None
+
+
+class InvestigatorRequest(BaseModel):
+    """Body for POST /api/investigate/{artifact_id}/explain (Phase 8).
+
+    `question` is an optional natural-language question. `counterfactual`
+    (when present) MUST be a well-formed counterfactual request — the
+    deterministic counterfactual engine evaluates it and the AI investigator
+    only explains the result. The LLM can never invent remediation scenarios.
+    """
+
+    question: str | None = None
+    counterfactual: CounterfactualRequest | None = None
 
 
 @app.get("/health")
@@ -163,4 +182,74 @@ def counterfactual(
         raise HTTPException(
             status_code=503,
             detail="FalkorDB unavailable or counterfactual analysis failed",
+        )
+
+
+@app.post("/api/investigate/{artifact_id}/explain")
+def investigate_explain(
+    artifact_id: str,
+    request: InvestigatorRequest,
+    max_depth: int | None = Query(default=None, ge=1, le=20),
+):
+    """Grounded AI security investigation (Phase 8) — LLM explains, graph decides.
+
+    Pipeline (the LLM comes LAST and can never bypass it):
+    resolve artifact -> deterministic investigation -> evidence -> risk
+    -> optionally ONE deterministic counterfactual analysis -> structured
+    context -> LLM explanation -> validated grounded report.
+
+    The returned `context` is the bounded, deterministic, secret-free fact
+    set the model was allowed to use; `analysis` is the validated report.
+    Every factual claim the model may make is cross-checked against the
+    context (risk score, vulnerability status, evidence ids, paths,
+    counterfactual deltas). Graph reasoning stays in FalkorDB; the LLM is
+    the explanation layer.
+
+    Errors: invalid counterfactual request -> 400; unknown artifact/target
+    -> 404; FalkorDB unavailable -> 503; LLM not configured / provider
+    failure / malformed or ungrounded output -> 503 (core deterministic
+    endpoints are unaffected).
+    """
+    try:
+        graph = get_graph()
+        cf = None
+        if request.counterfactual is not None:
+            cf = {
+                "action": request.counterfactual.action,
+                "target_version": request.counterfactual.target_version,
+                "target_id": request.counterfactual.target_id,
+                "application_id": request.counterfactual.application_id,
+            }
+        return investigator_investigate(
+            graph,
+            artifact_id,
+            question=request.question,
+            counterfactual=cf,
+            max_depth=max_depth,
+        )
+    except InvalidCounterfactual as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except LookupError:
+        raise HTTPException(
+            status_code=404,
+            detail=f"artifact '{artifact_id}' or remediation target not found in the graph",
+        )
+    except LLMContextError:
+        raise HTTPException(
+            status_code=503,
+            detail="AI investigator context validation failed (no details exposed)",
+        )
+    except LLMInvalidOutput:
+        raise HTTPException(
+            status_code=503,
+            detail="AI investigator returned malformed or ungrounded output",
+        )
+    except LLMUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(
+            status_code=503,
+            detail="FalkorDB unavailable or investigation failed",
         )

@@ -6,6 +6,7 @@ FalkorDB that can answer the core investigation question:
 
 > If artifact X becomes unsafe, which downstream systems are affected and through which paths?
 > And — with Phase 7 — *what happens if we remove / upgrade / isolate the unsafe artifact?*
+> And — with Phase 8 — *explain the deterministic investigation in plain language.*
 
 ## Node types (Phase 2 + Phase 5)
 | Label | Role | Example |
@@ -90,14 +91,18 @@ mistaken for evidence.
 - `seed.cypher` — deterministic synthetic seed data (idempotent via `MERGE`); incl.
   isolated `P3/PV3` (`pyyaml 5.3`, ecosystem `PyPI`) fixture for Phase 6
 - `seed.py` — applies schema + seed to FalkorDB
-- `verify.py` — traversal / negative / incident checks + Phase 3, 4 (R1–R12), 5 (E1–E12)
-  & 6 (P1–P14) tests; Phase 6 unit checks run with NO database (DB-degraded mode)
+- `verify.py` — traversal / negative / incident checks + Phase 3, 4 (R1–R12), 5 (E1–E12),
+  6 (P1–P14), 7 (C1–C15) & 8 (A1–A15) tests; Phase 6/8 unit checks run with NO database
+  (DB-degraded mode); Phase 8 uses a LOCAL fake model (no external LLM)
 - `queries.py` — Phase 3 blast-radius investigation + Phase 5 evidence queries (see below)
 - `risk.py` — Phase 4 deterministic risk engine (see below) + Phase 5 evidence factor
 - `osv.py` — Phase 6 public security-intelligence ingestion (OSV client, normalizer,
   PEP 440 version matcher, deterministic upsert plan, CLI) — see root README
 - `counterfactual.py` — Phase 7 counterfactual remediation engine (`analyze_counterfactual`,
   non-mutating remove/upgrade/isolate) — see root README
+- `investigator.py` — Phase 8 evidence-grounded AI investigator
+  (`build_investigation_context` / `compose_messages` / `_default_llm_client` /
+  `validate_report` / `investigate`) — see root README
 - `graphrag_schema.py` — Phase 6 GraphRAG SDK integration point (ontology spec +
   import-safe `build_graphrag_schema()`, prepared but NOT executed)
 
@@ -234,6 +239,30 @@ C8 risk-delta parity with the Phase 4 engine · C9 byte-identical determinism ·
 C10 **no-mutation guarantee** · C11 invalid action →400 (pre-DB) · C12 invalid
 target_version →400 (pre-DB) · C13 unknown artifact →404 · C14 DB failure propagates (→503)
 · C15 Phase 1–6 regression (blocked=empty behaves exactly like Phase 3).
+
+## Phase 8 evidence-grounded AI investigator
+`investigator.py` is the explanation layer on top of the deterministic engine. It NEVER
+computes graph facts: it builds a **bounded, secret-guarded context** from the
+deterministic pipeline output (`graph.queries` → `graph.risk` → `graph.counterfactual`),
+sends ONE OpenAI-compatible chat-completions request (temperature 0; no tool/agent loop),
+and **validates the model's report against the context** — rejecting any output that
+contradicts it (wrong risk score / level, `unknown` vuln status flipped to known/safe,
+fabricated evidence ids or paths, invented affected artifacts, remediation deltas that
+don't match the executed counterfactual). Unknown stays unknown; the graph is never
+mutated; no secrets reach the model; LLM failure is isolated (503) and every
+deterministic endpoint keeps working.
+
+Phase 8 coverage (A1–A15): A1 deterministic context projection · A2 real-graph grounding
+(D1: 9 affected, risk 74/VERY_HIGH, evidence E1/E3, production APP1/APP2) · A3 malformed
+model output rejected · A4 `unknown` preserved / flips rejected · A5 fabricated
+evidence/paths/surface rejected · A6 risk score/level immutable · A7 **no-mutation
+guarantee** (success AND failure) · A8 counterfactual deltas used verbatim (PV3→6.0:
+`known_unaffected`, risk reduction 9) · A9 unconfigured provider → 503, deterministic
+endpoints unaffected · A10 corrupted output rejected end-to-end fail-safe · A11 invalid
+counterfactual rejected before any DB query (→400) · A12 unknown artifact →404 ·
+A13 graph failure propagates (→503) · A14 identical prompt messages · A15 Phase 1–7
+regression. The live LLM call is validated separately with `INVESTIGATOR_LLM_*`
+credentials (reported `SKIPPED` when unset, as in this repository).
 
 ## Commands (from repo root, with FalkorDB running)
 ```
